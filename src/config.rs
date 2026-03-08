@@ -179,14 +179,30 @@ pub fn default_config_path() -> PathBuf {
     PathBuf::from(home).join(".clawhip").join("config.toml")
 }
 
-fn default_bind_host() -> String { "0.0.0.0".to_string() }
-fn default_port() -> u16 { 8765 }
-fn default_base_url() -> String { format!("http://127.0.0.1:{}", default_port()) }
-fn default_poll_interval() -> u64 { 5 }
-fn default_github_api_base() -> String { "https://api.github.com".to_string() }
-fn default_remote() -> String { "origin".to_string() }
-fn default_stale_minutes() -> u64 { 10 }
-fn default_true() -> bool { true }
+fn default_bind_host() -> String {
+    "0.0.0.0".to_string()
+}
+fn default_port() -> u16 {
+    25294
+}
+fn default_base_url() -> String {
+    format!("http://127.0.0.1:{}", default_port())
+}
+fn default_poll_interval() -> u64 {
+    5
+}
+fn default_github_api_base() -> String {
+    "https://api.github.com".to_string()
+}
+fn default_remote() -> String {
+    "origin".to_string()
+}
+fn default_stale_minutes() -> u64 {
+    10
+}
+fn default_true() -> bool {
+    true
+}
 
 impl AppConfig {
     pub fn load_or_default(path: &Path) -> Result<Self> {
@@ -246,11 +262,21 @@ impl AppConfig {
             println!("  7) Print config template hint");
             match prompt("Selection")?.trim() {
                 "1" => self.discord.bot_token = empty_to_none(prompt("Bot token")?),
-                "2" => self.daemon.base_url = prompt_with_default("Daemon base URL", Some(&self.daemon.base_url))?,
+                "2" => {
+                    self.daemon.base_url =
+                        prompt_with_default("Daemon base URL", Some(&self.daemon.base_url))?
+                }
                 "3" => self.defaults.channel = empty_to_none(prompt("Default channel")?),
                 "4" => self.defaults.format = prompt_format(Some(self.defaults.format.clone()))?,
-                "5" => { self.save(path)?; println!("Saved {}", path.display()); break; }
-                "6" => { println!("Discarded changes."); break; }
+                "5" => {
+                    self.save(path)?;
+                    println!("Saved {}", path.display());
+                    break;
+                }
+                "6" => {
+                    println!("Discarded changes.");
+                    break;
+                }
                 "7" => self.print_template_hint(),
                 _ => println!("Unknown selection."),
             }
@@ -260,12 +286,28 @@ impl AppConfig {
     }
 
     fn print_summary(&self) {
-        let token_status = if self.discord.bot_token.as_deref().unwrap_or_default().is_empty() { "missing" } else { "configured" };
+        let token_status = if self
+            .discord
+            .bot_token
+            .as_deref()
+            .unwrap_or_default()
+            .is_empty()
+        {
+            "missing"
+        } else {
+            "configured"
+        };
         println!("Current config summary:");
         println!("  Discord token: {token_status}");
         println!("  Daemon base URL: {}", self.daemon.base_url);
-        println!("  Bind host/port: {}:{}", self.daemon.bind_host, self.daemon.port);
-        println!("  Default channel: {}", self.defaults.channel.as_deref().unwrap_or("<unset>"));
+        println!(
+            "  Bind host/port: {}:{}",
+            self.daemon.bind_host, self.daemon.port
+        );
+        println!(
+            "  Default channel: {}",
+            self.defaults.channel.as_deref().unwrap_or("<unset>")
+        );
         println!("  Default format: {}", self.defaults.format.as_str());
         println!("  Routes: {}", self.routes.len());
         println!("  Git monitors: {}", self.monitors.git.repos.len());
@@ -274,7 +316,9 @@ impl AppConfig {
 
     fn print_template_hint(&self) {
         println!("Edit the config file directly for routes and monitor definitions.");
-        println!("Sections: [daemon], [[routes]], [[monitors.git.repos]], [[monitors.tmux.sessions]]");
+        println!(
+            "Sections: [daemon], [[routes]], [[monitors.git.repos]], [[monitors.tmux.sessions]]"
+        );
     }
 }
 
@@ -295,12 +339,21 @@ fn prompt_with_default(label: &str, default: Option<&str>) -> Result<String> {
 
 fn prompt_format(default: Option<MessageFormat>) -> Result<MessageFormat> {
     let default_value = default.unwrap_or(MessageFormat::Compact);
-    let input = prompt(&format!("Format [{}] (compact/alert/inline/raw)", default_value.as_str()))?;
-    if input.trim().is_empty() { return Ok(default_value); }
+    let input = prompt(&format!(
+        "Format [{}] (compact/alert/inline/raw)",
+        default_value.as_str()
+    ))?;
+    if input.trim().is_empty() {
+        return Ok(default_value);
+    }
     MessageFormat::from_label(input.trim())
 }
 
 fn empty_to_none(value: String) -> Option<String> {
     let trimmed = value.trim();
-    if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }

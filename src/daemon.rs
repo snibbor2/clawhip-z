@@ -20,6 +20,7 @@ use crate::router::Router;
 #[derive(Clone)]
 struct AppState {
     config: Arc<AppConfig>,
+    port: u16,
     router: Arc<Router>,
     discord: Arc<DiscordClient>,
     tmux_registry: SharedTmuxRegistry,
@@ -43,18 +44,22 @@ pub async fn run(config: Arc<AppConfig>, port_override: Option<u16>) -> Result<(
         .route("/api/event", post(post_event))
         .route("/events", post(post_event))
         .route("/api/tmux/register", post(register_tmux))
-        .route("/github", post(post_github))
-        .with_state(AppState {
-            config: config.clone(),
-            router,
-            discord,
-            tmux_registry,
-        });
-
+        .route("/github", post(post_github));
     let port = port_override.unwrap_or(config.daemon.port);
+
+    let app = app.with_state(AppState {
+        config: config.clone(),
+        port,
+        router,
+        discord,
+        tmux_registry,
+    });
     let addr: SocketAddr = format!("{}:{}", config.daemon.bind_host, port).parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    println!("clawhip daemon listening on http://{}", listener.local_addr()?);
+    println!(
+        "clawhip daemon listening on http://{}",
+        listener.local_addr()?
+    );
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -63,7 +68,7 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
     let registered = state.tmux_registry.read().await.len();
     Json(json!({
         "ok": true,
-        "port": state.config.daemon.port,
+        "port": state.port,
         "daemon_base_url": state.config.daemon.base_url,
         "configured_git_monitors": state.config.monitors.git.repos.len(),
         "configured_tmux_monitors": state.config.monitors.tmux.sessions.len(),
@@ -81,7 +86,11 @@ async fn post_event(
 ) -> impl IntoResponse {
     let event = normalize_event(event);
     match state.router.dispatch(&event, state.discord.as_ref()).await {
-        Ok(()) => (StatusCode::ACCEPTED, Json(json!({"ok": true, "type": event.kind}))).into_response(),
+        Ok(()) => (
+            StatusCode::ACCEPTED,
+            Json(json!({"ok": true, "type": event.kind})),
+        )
+            .into_response(),
         Err(error) => (
             StatusCode::BAD_REQUEST,
             Json(json!({"ok": false, "error": error.to_string()})),
