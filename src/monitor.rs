@@ -75,7 +75,10 @@ pub async fn run(
             &mut tmux_state,
         )
         .await;
-        sleep(Duration::from_secs(config.monitors.poll_interval_secs.max(1))).await;
+        sleep(Duration::from_secs(
+            config.monitors.poll_interval_secs.max(1),
+        ))
+        .await;
     }
 }
 
@@ -142,7 +145,9 @@ async fn poll_git(
                             repo.channel.clone(),
                         )
                         .with_format(repo.format.clone());
-                        if let Err(error) = dispatch_event(router, discord, &event, repo.mention.as_deref()).await {
+                        if let Err(error) =
+                            dispatch_event(router, discord, &event, repo.mention.as_deref()).await
+                        {
                             eprintln!("clawhip monitor git branch dispatch failed: {error}");
                         }
                     }
@@ -161,7 +166,10 @@ async fn poll_git(
                                 repo.channel.clone(),
                             )
                             .with_format(repo.format.clone());
-                            if let Err(error) = dispatch_event(router, discord, &event, repo.mention.as_deref()).await {
+                            if let Err(error) =
+                                dispatch_event(router, discord, &event, repo.mention.as_deref())
+                                    .await
+                            {
                                 eprintln!("clawhip monitor git commit dispatch failed: {error}");
                             }
                         }
@@ -170,7 +178,14 @@ async fn poll_git(
 
                 let prs = if repo.emit_pr_status {
                     if let Some(client) = github_client {
-                        match fetch_pull_requests(client, &config.monitors.github_api_base, repo, &snapshot).await {
+                        match fetch_pull_requests(
+                            client,
+                            &config.monitors.github_api_base,
+                            repo,
+                            &snapshot,
+                        )
+                        .await
+                        {
                             Ok(prs) => {
                                 if let Some(previous) = previous {
                                     for (number, pr) in &prs {
@@ -181,14 +196,24 @@ async fn poll_git(
                                                     snapshot.repo_name.clone(),
                                                     *number,
                                                     pr.title.clone(),
-                                                    old.map(|value| value.status.clone()).unwrap_or_else(|| "<new>".to_string()),
+                                                    old.map(|value| value.status.clone())
+                                                        .unwrap_or_else(|| "<new>".to_string()),
                                                     pr.status.clone(),
                                                     pr.url.clone(),
                                                     repo.channel.clone(),
                                                 )
                                                 .with_format(repo.format.clone());
-                                                if let Err(error) = dispatch_event(router, discord, &event, repo.mention.as_deref()).await {
-                                                    eprintln!("clawhip monitor PR dispatch failed: {error}");
+                                                if let Err(error) = dispatch_event(
+                                                    router,
+                                                    discord,
+                                                    &event,
+                                                    repo.mention.as_deref(),
+                                                )
+                                                .await
+                                                {
+                                                    eprintln!(
+                                                        "clawhip monitor PR dispatch failed: {error}"
+                                                    );
                                                 }
                                             }
                                         }
@@ -197,7 +222,10 @@ async fn poll_git(
                                 prs
                             }
                             Err(error) => {
-                                eprintln!("clawhip monitor GitHub polling failed for {}: {error}", repo.path);
+                                eprintln!(
+                                    "clawhip monitor GitHub polling failed for {}: {error}",
+                                    repo.path
+                                );
                                 previous.map(|entry| entry.prs.clone()).unwrap_or_default()
                             }
                         }
@@ -217,7 +245,10 @@ async fn poll_git(
                     },
                 );
             }
-            Err(error) => eprintln!("clawhip monitor git snapshot failed for {}: {error}", repo.path),
+            Err(error) => eprintln!(
+                "clawhip monitor git snapshot failed for {}: {error}",
+                repo.path
+            ),
         }
     }
 }
@@ -234,7 +265,12 @@ async fn poll_tmux(
         .tmux
         .sessions
         .iter()
-        .map(|session| (session.session.clone(), RegisteredTmuxSession::from(session)))
+        .map(|session| {
+            (
+                session.session.clone(),
+                RegisteredTmuxSession::from(session),
+            )
+        })
         .collect();
     for (session, registration) in registry.read().await.iter() {
         sessions.insert(session.clone(), registration.clone());
@@ -251,7 +287,10 @@ async fn poll_tmux(
                 continue;
             }
             Err(error) => {
-                eprintln!("clawhip monitor tmux has-session failed for {}: {error}", session_name);
+                eprintln!(
+                    "clawhip monitor tmux has-session failed for {}: {error}",
+                    session_name
+                );
                 continue;
             }
             Ok(true) => {}
@@ -281,7 +320,11 @@ async fn poll_tmux(
                         }
                         Some(existing) => {
                             if existing.content_hash != hash {
-                                let hits = collect_keyword_hits(&existing.snapshot, &pane.content, &registration.keywords);
+                                let hits = collect_keyword_hits(
+                                    &existing.snapshot,
+                                    &pane.content,
+                                    &registration.keywords,
+                                );
                                 for hit in hits {
                                     let event = IncomingEvent::tmux_keyword(
                                         pane.session.clone(),
@@ -290,8 +333,17 @@ async fn poll_tmux(
                                         registration.channel.clone(),
                                     )
                                     .with_format(registration.format.clone());
-                                    if let Err(error) = dispatch_event(router, discord, &event, registration.mention.as_deref()).await {
-                                        eprintln!("clawhip monitor tmux keyword dispatch failed: {error}");
+                                    if let Err(error) = dispatch_event(
+                                        router,
+                                        discord,
+                                        &event,
+                                        registration.mention.as_deref(),
+                                    )
+                                    .await
+                                    {
+                                        eprintln!(
+                                            "clawhip monitor tmux keyword dispatch failed: {error}"
+                                        );
                                     }
                                 }
                                 existing.pane_name = pane.pane_name;
@@ -300,8 +352,10 @@ async fn poll_tmux(
                                 existing.last_change = now;
                                 existing.last_stale_notification = None;
                             } else {
-                                let stale_after = Duration::from_secs(registration.stale_minutes.max(1) * 60);
-                                let should_notify = now.duration_since(existing.last_change) >= stale_after
+                                let stale_after =
+                                    Duration::from_secs(registration.stale_minutes.max(1) * 60);
+                                let should_notify = now.duration_since(existing.last_change)
+                                    >= stale_after
                                     && existing
                                         .last_stale_notification
                                         .map(|previous| now.duration_since(previous) >= stale_after)
@@ -315,8 +369,17 @@ async fn poll_tmux(
                                         registration.channel.clone(),
                                     )
                                     .with_format(registration.format.clone());
-                                    if let Err(error) = dispatch_event(router, discord, &event, registration.mention.as_deref()).await {
-                                        eprintln!("clawhip monitor tmux stale dispatch failed: {error}");
+                                    if let Err(error) = dispatch_event(
+                                        router,
+                                        discord,
+                                        &event,
+                                        registration.mention.as_deref(),
+                                    )
+                                    .await
+                                    {
+                                        eprintln!(
+                                            "clawhip monitor tmux stale dispatch failed: {error}"
+                                        );
                                     }
                                     existing.last_stale_notification = Some(now);
                                 }
@@ -325,7 +388,10 @@ async fn poll_tmux(
                     }
                 }
             }
-            Err(error) => eprintln!("clawhip monitor tmux snapshot failed for {}: {error}", session_name),
+            Err(error) => eprintln!(
+                "clawhip monitor tmux snapshot failed for {}: {error}",
+                session_name
+            ),
         }
     }
 
@@ -354,23 +420,39 @@ async fn dispatch_event(
 
 async fn snapshot_git_repo(repo: &GitRepoMonitor) -> Result<GitSnapshot> {
     let head = run_command(&git_bin(), &["-C", &repo.path, "rev-parse", "HEAD"]).await?;
-    let branch = run_command(&git_bin(), &["-C", &repo.path, "rev-parse", "--abbrev-ref", "HEAD"]).await?;
+    let branch = run_command(
+        &git_bin(),
+        &["-C", &repo.path, "rev-parse", "--abbrev-ref", "HEAD"],
+    )
+    .await?;
     let summary = run_command(&git_bin(), &["-C", &repo.path, "log", "-1", "--pretty=%s"]).await?;
     let remote_url = run_command(
         &git_bin(),
-        &["-C", &repo.path, "config", "--get", &format!("remote.{}.url", repo.remote)],
+        &[
+            "-C",
+            &repo.path,
+            "config",
+            "--get",
+            &format!("remote.{}.url", repo.remote),
+        ],
     )
     .await
     .unwrap_or_default();
     Ok(GitSnapshot {
-        repo_name: repo
-            .name
-            .clone()
-            .unwrap_or_else(|| Path::new(&repo.path).file_name().and_then(|name| name.to_str()).unwrap_or(&repo.path).to_string()),
+        repo_name: repo.name.clone().unwrap_or_else(|| {
+            Path::new(&repo.path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(&repo.path)
+                .to_string()
+        }),
         branch,
         head: head.clone(),
         commits: vec![CommitEntry { sha: head, summary }],
-        github_repo: repo.github_repo.clone().or_else(|| parse_github_repo(&remote_url)),
+        github_repo: repo
+            .github_repo
+            .clone()
+            .or_else(|| parse_github_repo(&remote_url)),
     })
 }
 
@@ -391,7 +473,10 @@ async fn list_new_commits(repo: &GitRepoMonitor, old: &str, new: &str) -> Result
         .lines()
         .filter_map(|line| {
             let (sha, summary) = line.split_once('\u{1f}')?;
-            Some(CommitEntry { sha: sha.to_string(), summary: summary.to_string() })
+            Some(CommitEntry {
+                sha: sha.to_string(),
+                summary: summary.to_string(),
+            })
         })
         .collect())
 }
@@ -407,7 +492,11 @@ async fn fetch_pull_requests(
         .clone()
         .ok_or_else(|| format!("no GitHub repo configured or inferred for {}", repo.path))?;
     let response = client
-        .get(format!("{}/repos/{}/pulls", api_base.trim_end_matches('/'), github_repo))
+        .get(format!(
+            "{}/repos/{}/pulls",
+            api_base.trim_end_matches('/'),
+            github_repo
+        ))
         .query(&[("state", "all"), ("per_page", "100")])
         .send()
         .await?;
@@ -420,17 +509,30 @@ async fn fetch_pull_requests(
     Ok(pulls
         .into_iter()
         .map(|pull| {
-            let status = if pull.merged_at.is_some() { "merged".to_string() } else { pull.state };
+            let status = if pull.merged_at.is_some() {
+                "merged".to_string()
+            } else {
+                pull.state
+            };
             (
                 pull.number,
-                PullRequestSnapshot { title: pull.title, status, url: pull.html_url },
+                PullRequestSnapshot {
+                    title: pull.title,
+                    status,
+                    url: pull.html_url,
+                },
             )
         })
         .collect())
 }
 
 async fn session_exists(session: &str) -> Result<bool> {
-    let output = Command::new(tmux_bin()).arg("has-session").arg("-t").arg(session).output().await?;
+    let output = Command::new(tmux_bin())
+        .arg("has-session")
+        .arg("-t")
+        .arg(session)
+        .output()
+        .await?;
     Ok(output.status.success())
 }
 
@@ -444,7 +546,10 @@ async fn snapshot_tmux_session(session: &str) -> Result<Vec<TmuxPaneSnapshot>> {
         .output()
         .await?;
     if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string().into());
+        return Err(String::from_utf8_lossy(&output.stderr)
+            .trim()
+            .to_string()
+            .into());
     }
     let mut panes = Vec::new();
     for line in String::from_utf8(output.stdout)?.lines() {
@@ -465,7 +570,10 @@ async fn snapshot_tmux_session(session: &str) -> Result<Vec<TmuxPaneSnapshot>> {
             .output()
             .await?;
         if !capture.status.success() {
-            return Err(String::from_utf8_lossy(&capture.stderr).trim().to_string().into());
+            return Err(String::from_utf8_lossy(&capture.stderr)
+                .trim()
+                .to_string()
+                .into());
         }
         panes.push(TmuxPaneSnapshot {
             pane_id,
@@ -480,11 +588,19 @@ async fn snapshot_tmux_session(session: &str) -> Result<Vec<TmuxPaneSnapshot>> {
 fn build_github_client(token: Option<String>) -> Result<reqwest::Client> {
     let mut headers = HeaderMap::new();
     headers.insert(USER_AGENT, HeaderValue::from_static("clawhip/0.1"));
-    headers.insert(ACCEPT, HeaderValue::from_static("application/vnd.github+json"));
+    headers.insert(
+        ACCEPT,
+        HeaderValue::from_static("application/vnd.github+json"),
+    );
     if let Some(token) = token {
-        headers.insert(AUTHORIZATION, HeaderValue::from_str(&format!("Bearer {token}"))?);
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}"))?,
+        );
     }
-    Ok(reqwest::Client::builder().default_headers(headers).build()?)
+    Ok(reqwest::Client::builder()
+        .default_headers(headers)
+        .build()?)
 }
 
 async fn run_command(binary: &str, args: &[&str]) -> Result<String> {
@@ -492,7 +608,13 @@ async fn run_command(binary: &str, args: &[&str]) -> Result<String> {
     if output.status.success() {
         Ok(String::from_utf8(output.stdout)?.trim().to_string())
     } else {
-        Err(format!("{} {:?} failed: {}", binary, args, String::from_utf8_lossy(&output.stderr).trim()).into())
+        Err(format!(
+            "{} {:?} failed: {}",
+            binary,
+            args,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into())
     }
 }
 
@@ -506,8 +628,14 @@ fn collect_keyword_hits(previous: &str, current: &str, keywords: &[String]) -> V
         .filter(|line| !previous_lines.contains(*line))
         .flat_map(|line| {
             keywords.iter().filter_map(move |keyword| {
-                if line.to_ascii_lowercase().contains(&keyword.to_ascii_lowercase()) {
-                    Some(KeywordHit { keyword: keyword.clone(), line: line.to_string() })
+                if line
+                    .to_ascii_lowercase()
+                    .contains(&keyword.to_ascii_lowercase())
+                {
+                    Some(KeywordHit {
+                        keyword: keyword.clone(),
+                        line: line.to_string(),
+                    })
                 } else {
                     None
                 }
@@ -574,8 +702,14 @@ mod tests {
 
     #[test]
     fn parses_github_repo_urls() {
-        assert_eq!(parse_github_repo("git@github.com:bellman/clawhip.git"), Some("bellman/clawhip".to_string()));
-        assert_eq!(parse_github_repo("https://github.com/bellman/clawhip.git"), Some("bellman/clawhip".to_string()));
+        assert_eq!(
+            parse_github_repo("git@github.com:bellman/clawhip.git"),
+            Some("bellman/clawhip".to_string())
+        );
+        assert_eq!(
+            parse_github_repo("https://github.com/bellman/clawhip.git"),
+            Some("bellman/clawhip".to_string())
+        );
     }
 
     #[test]

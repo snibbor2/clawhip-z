@@ -26,11 +26,17 @@ impl DaemonClient {
     }
 
     pub async fn register_tmux(&self, registration: &RegisteredTmuxSession) -> Result<()> {
-        self.post_json("/api/tmux/register", registration).await.map(|_| ())
+        self.post_json("/api/tmux/register", registration)
+            .await
+            .map(|_| ())
     }
 
     pub async fn health(&self) -> Result<Value> {
-        let response = self.http.get(format!("{}/health", self.base_url)).send().await?;
+        let response = self
+            .http
+            .get(format!("{}/health", self.base_url))
+            .send()
+            .await?;
         if response.status().is_success() {
             Ok(response.json().await?)
         } else {

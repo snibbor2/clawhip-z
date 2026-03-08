@@ -26,7 +26,11 @@ pub async fn run(args: TmuxNewArgs, config: &AppConfig) -> Result<()> {
 
 async fn launch_session(args: &TmuxNewArgs) -> Result<()> {
     let mut command = Command::new(tmux_bin());
-    command.arg("new-session").arg("-d").arg("-s").arg(&args.session);
+    command
+        .arg("new-session")
+        .arg("-d")
+        .arg("-s")
+        .arg(&args.session);
     if let Some(window_name) = &args.window_name {
         command.arg("-n").arg(window_name);
     }
@@ -41,7 +45,10 @@ async fn launch_session(args: &TmuxNewArgs) -> Result<()> {
     if output.status.success() {
         Ok(())
     } else {
-        Err(String::from_utf8_lossy(&output.stderr).trim().to_string().into())
+        Err(String::from_utf8_lossy(&output.stderr)
+            .trim()
+            .to_string()
+            .into())
     }
 }
 
@@ -55,7 +62,10 @@ async fn attach_session(session: &str) -> Result<()> {
     if output.status.success() {
         Ok(())
     } else {
-        Err(String::from_utf8_lossy(&output.stderr).trim().to_string().into())
+        Err(String::from_utf8_lossy(&output.stderr)
+            .trim()
+            .to_string()
+            .into())
     }
 }
 

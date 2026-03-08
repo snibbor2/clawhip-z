@@ -9,9 +9,9 @@
   "dispatch_drain": {
     "enabled": true,
     "max_per_tick": 5,
-    "run_count": 3918,
+    "run_count": 5332,
     "leader_only": true,
-    "last_tick_at": "2026-03-08T11:17:43.898Z",
+    "last_tick_at": "2026-03-08T11:35:15.020Z",
     "last_result": {
       "processed": 0,
       "skipped": 0,

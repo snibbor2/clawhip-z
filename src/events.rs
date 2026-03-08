@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::io::{self, Read};
 
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
@@ -387,38 +386,6 @@ pub fn render_template(template: &str, context: &BTreeMap<String, String>) -> St
     rendered
 }
 
-pub fn read_stdin() -> Result<String> {
-    let mut buf = String::new();
-    io::stdin().read_to_string(&mut buf)?;
-    Ok(buf)
-}
-
-pub fn parse_stream(body: &str) -> Result<Vec<IncomingEvent>> {
-    let trimmed = body.trim();
-    if trimmed.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    if trimmed.starts_with('[') {
-        return serde_json::from_str::<Vec<IncomingEvent>>(trimmed)
-            .map(|events| events.into_iter().map(normalize_event).collect())
-            .map_err(Into::into);
-    }
-
-    if !trimmed.contains('\n') && trimmed.starts_with('{') {
-        return serde_json::from_str::<IncomingEvent>(trimmed)
-            .map(|event| vec![normalize_event(event)])
-            .map_err(Into::into);
-    }
-
-    trimmed
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| serde_json::from_str::<IncomingEvent>(line).map(normalize_event))
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(Into::into)
-}
-
 pub fn normalize_event(mut event: IncomingEvent) -> IncomingEvent {
     event.kind = event.canonical_kind().to_string();
     if !event.payload.is_object() {
@@ -489,30 +456,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_ndjson_stream() {
-        let events = parse_stream(
-            r#"{"type":"custom","payload":{"message":"one"}}
-{"type":"custom","payload":{"message":"two"}}"#,
-        )
-        .unwrap();
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[1].payload["message"], "two");
-    }
-
-    #[test]
     fn renders_template_from_payload() {
         let event = IncomingEvent::github_issue_opened("repo".into(), 42, "broken".into(), None);
         let rendered = render_template("{repo} #{number}: {title}", &event.template_context());
         assert_eq!(rendered, "repo #42: broken");
-    }
-
-    #[test]
-    fn accepts_flat_custom_events() {
-        let event = parse_stream(r#"{"type":"custom","message":"flat"}"#)
-            .unwrap()
-            .into_iter()
-            .next()
-            .unwrap();
-        assert_eq!(event.payload["message"], "flat");
     }
 }
