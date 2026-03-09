@@ -169,6 +169,7 @@ async fn monitor_session(args: TmuxMonitorArgs, client: DaemonClient) -> Result<
                                 args.channel.clone(),
                             );
                             event.format = args.format.map(Into::into);
+                            event.mention = args.mention.clone();
                             client.send_event(&event).await?;
                         }
 
@@ -192,6 +193,7 @@ async fn monitor_session(args: TmuxMonitorArgs, client: DaemonClient) -> Result<
                             args.channel.clone(),
                         );
                         event.format = args.format.map(Into::into);
+                        event.mention = args.mention.clone();
                         client.send_event(&event).await?;
                         existing.last_stale_notification = Some(now);
                     }
