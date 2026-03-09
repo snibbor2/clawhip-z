@@ -431,6 +431,7 @@ mod tests {
             },
             routes: vec![RouteRule {
                 event: "github.*".into(),
+                sink: "discord".into(),
                 filter: [("repo".to_string(), "clawhip".to_string())]
                     .into_iter()
                     .collect(),

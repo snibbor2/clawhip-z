@@ -1,22 +1,32 @@
+use std::collections::HashMap;
+
 use tokio::sync::mpsc;
 
 use crate::Result;
-use crate::discord::DiscordClient;
 use crate::events::IncomingEvent;
+use crate::render::Renderer;
 use crate::router::Router;
+use crate::sink::Sink;
 
 pub struct Dispatcher {
     rx: mpsc::Receiver<IncomingEvent>,
     router: Router,
-    discord: DiscordClient,
+    renderer: Box<dyn Renderer>,
+    sinks: HashMap<String, Box<dyn Sink>>,
 }
 
 impl Dispatcher {
-    pub fn new(rx: mpsc::Receiver<IncomingEvent>, router: Router, discord: DiscordClient) -> Self {
+    pub fn new(
+        rx: mpsc::Receiver<IncomingEvent>,
+        router: Router,
+        renderer: Box<dyn Renderer>,
+        sinks: HashMap<String, Box<dyn Sink>>,
+    ) -> Self {
         Self {
             rx,
             router,
-            discord,
+            renderer,
+            sinks,
         }
     }
 
@@ -34,10 +44,35 @@ impl Dispatcher {
             };
 
             for delivery in deliveries {
-                if let Err(error) = self.discord.send(&delivery.target, &delivery.content).await {
+                let Some(sink) = self.sinks.get(delivery.sink.as_str()) else {
                     eprintln!(
-                        "clawhip dispatcher delivery failed to {:?}: {error}",
-                        delivery.target
+                        "clawhip dispatcher missing sink '{}' for target {:?}",
+                        delivery.sink, delivery.target
+                    );
+                    continue;
+                };
+
+                let content = match self
+                    .router
+                    .render_delivery(&event, &delivery, self.renderer.as_ref())
+                    .await
+                {
+                    Ok(content) => content,
+                    Err(error) => {
+                        eprintln!(
+                            "clawhip dispatcher failed to render {} for {}/ {:?}: {error}",
+                            event.canonical_kind(),
+                            delivery.sink,
+                            delivery.target
+                        );
+                        continue;
+                    }
+                };
+
+                if let Err(error) = sink.send(&delivery.target, &content).await {
+                    eprintln!(
+                        "clawhip dispatcher delivery failed to {}/ {:?}: {error}",
+                        delivery.sink, delivery.target
                     );
                 }
             }
@@ -49,18 +84,29 @@ impl Dispatcher {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     use super::*;
     use crate::config::{AppConfig, RouteRule};
+    use crate::render::DefaultRenderer;
+    use crate::sink::DiscordSink;
+
+    fn test_dispatcher(rx: mpsc::Receiver<IncomingEvent>, router: Router) -> Dispatcher {
+        let mut sinks: HashMap<String, Box<dyn Sink>> = HashMap::new();
+        sinks.insert(
+            "discord".into(),
+            Box::new(DiscordSink::from_config(Arc::new(AppConfig::default())).unwrap()),
+        );
+        Dispatcher::new(rx, router, Box::new(DefaultRenderer), sinks)
+    }
 
     #[tokio::test]
     async fn dispatcher_stops_cleanly_when_channel_closes() {
         let (tx, rx) = mpsc::channel(1);
         drop(tx);
         let router = Router::new(Arc::new(AppConfig::default()));
-        let discord = DiscordClient::from_config(Arc::new(AppConfig::default())).unwrap();
-        let mut dispatcher = Dispatcher::new(rx, router, discord);
+        let mut dispatcher = test_dispatcher(rx, router);
 
         dispatcher.run().await.unwrap();
     }
@@ -93,6 +139,7 @@ mod tests {
             routes: vec![
                 RouteRule {
                     event: "tmux.keyword".into(),
+                    sink: "discord".into(),
                     filter: Default::default(),
                     channel: None,
                     webhook: Some(failing_webhook),
@@ -103,6 +150,7 @@ mod tests {
                 },
                 RouteRule {
                     event: "tmux.keyword".into(),
+                    sink: "discord".into(),
                     filter: Default::default(),
                     channel: None,
                     webhook: Some(successful_webhook),
@@ -116,8 +164,7 @@ mod tests {
         };
         let (tx, rx) = mpsc::channel(1);
         let router = Router::new(Arc::new(config));
-        let discord = DiscordClient::from_config(Arc::new(AppConfig::default())).unwrap();
-        let mut dispatcher = Dispatcher::new(rx, router, discord);
+        let mut dispatcher = test_dispatcher(rx, router);
         let task = tokio::spawn(async move { dispatcher.run().await.unwrap() });
 
         tx.send(IncomingEvent::tmux_keyword(

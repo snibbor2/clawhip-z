@@ -10,7 +10,9 @@ mod events;
 mod keyword_window;
 mod lifecycle;
 mod plugins;
+mod render;
 mod router;
+mod sink;
 mod source;
 mod tmux_wrapper;
 

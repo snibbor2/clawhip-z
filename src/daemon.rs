@@ -13,11 +13,12 @@ use tokio::sync::{RwLock, mpsc};
 use crate::Result;
 use crate::VERSION;
 use crate::config::AppConfig;
-use crate::discord::DiscordClient;
 use crate::dispatch::Dispatcher;
 use crate::event::compat::from_incoming_event;
 use crate::events::{IncomingEvent, normalize_event};
+use crate::render::{DefaultRenderer, Renderer};
 use crate::router::Router;
+use crate::sink::{DiscordSink, Sink};
 use crate::source::{
     GitHubSource, GitSource, RegisteredTmuxSession, SharedTmuxRegistry, Source, TmuxSource,
 };
@@ -37,13 +38,18 @@ pub async fn run(config: Arc<AppConfig>, port_override: Option<u16>) -> Result<(
     let token_source = config.discord_token_source();
     println!("clawhip v{VERSION} starting (token_source: {token_source})");
 
-    let discord = DiscordClient::from_config(config.clone())?;
+    let mut sinks: HashMap<String, Box<dyn Sink>> = HashMap::new();
+    sinks.insert(
+        "discord".into(),
+        Box::new(DiscordSink::from_config(config.clone())?),
+    );
+    let renderer: Box<dyn Renderer> = Box::new(DefaultRenderer);
     let router = Router::new(config.clone());
     let tmux_registry: SharedTmuxRegistry = Arc::new(RwLock::new(HashMap::new()));
     let (tx, rx) = mpsc::channel(EVENT_QUEUE_CAPACITY);
 
     tokio::spawn(async move {
-        let mut dispatcher = Dispatcher::new(rx, router, discord);
+        let mut dispatcher = Dispatcher::new(rx, router, renderer, sinks);
         if let Err(error) = dispatcher.run().await {
             eprintln!("clawhip dispatcher stopped: {error}");
         }
@@ -218,22 +224,27 @@ async fn post_github(
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
-            let merged = payload
-                .pointer("/pull_request/merged")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            let transition = match action {
-                "opened" => Some(("<new>".to_string(), "open".to_string())),
-                "reopened" => Some(("closed".to_string(), "open".to_string())),
-                "closed" if merged => Some(("open".to_string(), "merged".to_string())),
-                "closed" => Some(("open".to_string(), "closed".to_string())),
+            match action {
+                "opened" => Some(normalize_event(IncomingEvent::github_pr_status_changed(
+                    repo,
+                    number,
+                    title,
+                    "unknown".to_string(),
+                    "opened".to_string(),
+                    url,
+                    None,
+                ))),
+                "closed" => Some(normalize_event(IncomingEvent::github_pr_status_changed(
+                    repo,
+                    number,
+                    title,
+                    "open".to_string(),
+                    "closed".to_string(),
+                    url,
+                    None,
+                ))),
                 _ => None,
-            };
-            transition.map(|(old_status, new_status)| {
-                normalize_event(IncomingEvent::github_pr_status_changed(
-                    repo, number, title, old_status, new_status, url, None,
-                ))
-            })
+            }
         }
         _ => None,
     };
@@ -283,7 +294,7 @@ mod tests {
     #[test]
     fn health_payload_includes_version_and_token_source() {
         let mut config = AppConfig::default();
-        config.discord.bot_token = Some("config-token".into());
+        config.providers.discord.bot_token = Some("config-token".into());
         config.monitors.git.repos.push(Default::default());
         config.monitors.tmux.sessions.push(Default::default());
 
