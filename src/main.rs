@@ -3,14 +3,15 @@ mod client;
 mod config;
 mod daemon;
 mod discord;
+mod dispatch;
 mod dynamic_tokens;
 mod event;
 mod events;
 mod keyword_window;
 mod lifecycle;
-mod monitor;
 mod plugins;
 mod router;
+mod source;
 mod tmux_wrapper;
 
 use std::sync::Arc;

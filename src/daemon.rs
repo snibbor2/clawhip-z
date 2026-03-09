@@ -8,23 +8,27 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router as AxumRouter};
 use serde_json::{Value, json};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, mpsc};
 
 use crate::Result;
 use crate::VERSION;
 use crate::config::AppConfig;
 use crate::discord::DiscordClient;
+use crate::dispatch::Dispatcher;
 use crate::event::compat::from_incoming_event;
 use crate::events::{IncomingEvent, normalize_event};
-use crate::monitor::{self, RegisteredTmuxSession, SharedTmuxRegistry};
 use crate::router::Router;
+use crate::source::{
+    GitHubSource, GitSource, RegisteredTmuxSession, SharedTmuxRegistry, Source, TmuxSource,
+};
+
+const EVENT_QUEUE_CAPACITY: usize = 256;
 
 #[derive(Clone)]
 struct AppState {
     config: Arc<AppConfig>,
     port: u16,
-    router: Arc<Router>,
-    discord: Arc<DiscordClient>,
+    tx: mpsc::Sender<IncomingEvent>,
     tmux_registry: SharedTmuxRegistry,
 }
 
@@ -33,16 +37,23 @@ pub async fn run(config: Arc<AppConfig>, port_override: Option<u16>) -> Result<(
     let token_source = config.discord_token_source();
     println!("clawhip v{VERSION} starting (token_source: {token_source})");
 
-    let discord = Arc::new(DiscordClient::from_config(config.clone())?);
-    let router = Arc::new(Router::new(config.clone()));
+    let discord = DiscordClient::from_config(config.clone())?;
+    let router = Router::new(config.clone());
     let tmux_registry: SharedTmuxRegistry = Arc::new(RwLock::new(HashMap::new()));
+    let (tx, rx) = mpsc::channel(EVENT_QUEUE_CAPACITY);
 
-    tokio::spawn(monitor::run(
-        config.clone(),
-        router.clone(),
-        discord.clone(),
-        tmux_registry.clone(),
-    ));
+    tokio::spawn(async move {
+        let mut dispatcher = Dispatcher::new(rx, router, discord);
+        if let Err(error) = dispatcher.run().await {
+            eprintln!("clawhip dispatcher stopped: {error}");
+        }
+    });
+    spawn_source(GitSource::new(config.clone()), tx.clone());
+    spawn_source(GitHubSource::new(config.clone()), tx.clone());
+    spawn_source(
+        TmuxSource::new(config.clone(), tmux_registry.clone()),
+        tx.clone(),
+    );
 
     let app = AxumRouter::new()
         .route("/health", get(health))
@@ -57,8 +68,7 @@ pub async fn run(config: Arc<AppConfig>, port_override: Option<u16>) -> Result<(
     let app = app.with_state(AppState {
         config: config.clone(),
         port,
-        router,
-        discord,
+        tx,
         tmux_registry,
     });
     let addr: SocketAddr = format!("{}:{}", config.daemon.bind_host, port).parse()?;
@@ -69,6 +79,18 @@ pub async fn run(config: Arc<AppConfig>, port_override: Option<u16>) -> Result<(
     );
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+fn spawn_source<S>(source: S, tx: mpsc::Sender<IncomingEvent>)
+where
+    S: Source + Send + Sync + 'static,
+{
+    tokio::spawn(async move {
+        println!("clawhip source '{}' starting", source.name());
+        if let Err(error) = source.run(tx).await {
+            eprintln!("clawhip source '{}' stopped: {error}", source.name());
+        }
+    });
 }
 
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
@@ -110,14 +132,15 @@ async fn post_event(
         )
             .into_response();
     }
-    match dispatch_event(state.router.as_ref(), state.discord.as_ref(), &event).await {
+
+    match enqueue_event(&state.tx, event.clone()).await {
         Ok(()) => (
             StatusCode::ACCEPTED,
             Json(json!({"ok": true, "type": event.kind})),
         )
             .into_response(),
         Err(error) => (
-            StatusCode::BAD_REQUEST,
+            StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"ok": false, "error": error.to_string()})),
         )
             .into_response(),
@@ -154,33 +177,25 @@ async fn post_github(
         .and_then(Value::as_str)
         .unwrap_or_default();
 
-    let dispatch_result = match event_name {
+    let event = match event_name {
         "issues" if action == "opened" => {
-            let repo = payload
-                .pointer("/repository/full_name")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown/unknown")
-                .to_string();
-            let number = payload
-                .pointer("/issue/number")
-                .and_then(Value::as_u64)
-                .unwrap_or_default();
-            let title = payload
-                .pointer("/issue/title")
-                .and_then(Value::as_str)
-                .unwrap_or("Untitled issue")
-                .to_string();
-            let event = normalize_event(IncomingEvent::github_issue_opened(
-                repo, number, title, None,
-            ));
-            if let Err(error) = from_incoming_event(&event) {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({"ok": false, "error": error.to_string()})),
-                )
-                    .into_response();
-            }
-            dispatch_event(state.router.as_ref(), state.discord.as_ref(), &event).await
+            Some(normalize_event(IncomingEvent::github_issue_opened(
+                payload
+                    .pointer("/repository/full_name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown/unknown")
+                    .to_string(),
+                payload
+                    .pointer("/issue/number")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default(),
+                payload
+                    .pointer("/issue/title")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Untitled issue")
+                    .to_string(),
+                None,
+            )))
         }
         "pull_request" => {
             let repo = payload
@@ -214,60 +229,50 @@ async fn post_github(
                 "closed" => Some(("open".to_string(), "closed".to_string())),
                 _ => None,
             };
-            if let Some((old_status, new_status)) = transition {
-                let event = normalize_event(IncomingEvent::github_pr_status_changed(
+            transition.map(|(old_status, new_status)| {
+                normalize_event(IncomingEvent::github_pr_status_changed(
                     repo, number, title, old_status, new_status, url, None,
-                ));
-                if let Err(error) = from_incoming_event(&event) {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(json!({"ok": false, "error": error.to_string()})),
-                    )
-                        .into_response();
-                }
-                dispatch_event(state.router.as_ref(), state.discord.as_ref(), &event).await
-            } else {
-                return (
-                    StatusCode::ACCEPTED,
-                    Json(json!({"ok": true, "ignored": true, "reason": "unsupported pull_request action"})),
-                )
-                    .into_response();
-            }
+                ))
+            })
         }
-        _ => {
-            return (
-                StatusCode::ACCEPTED,
-                Json(json!({"ok": true, "ignored": true, "reason": "unsupported event"})),
-            )
-                .into_response();
-        }
+        _ => None,
     };
 
-    match dispatch_result {
+    let Some(event) = event else {
+        let reason = if event_name == "pull_request" {
+            "unsupported pull_request action"
+        } else {
+            "unsupported event"
+        };
+        return (
+            StatusCode::ACCEPTED,
+            Json(json!({"ok": true, "ignored": true, "reason": reason})),
+        )
+            .into_response();
+    };
+
+    if let Err(error) = from_incoming_event(&event) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"ok": false, "error": error.to_string()})),
+        )
+            .into_response();
+    }
+
+    match enqueue_event(&state.tx, event).await {
         Ok(()) => (StatusCode::ACCEPTED, Json(json!({"ok": true}))).into_response(),
         Err(error) => (
-            StatusCode::BAD_REQUEST,
+            StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"ok": false, "error": error.to_string()})),
         )
             .into_response(),
     }
 }
 
-async fn dispatch_event(
-    router: &Router,
-    discord: &DiscordClient,
-    event: &IncomingEvent,
-) -> Result<()> {
-    for delivery in router.resolve(event).await? {
-        if let Err(error) = discord.send(&delivery.target, &delivery.content).await {
-            eprintln!(
-                "clawhip daemon delivery failed to {:?}: {error}",
-                delivery.target
-            );
-        }
-    }
-
-    Ok(())
+async fn enqueue_event(tx: &mpsc::Sender<IncomingEvent>, event: IncomingEvent) -> Result<()> {
+    tx.send(event)
+        .await
+        .map_err(|error| format!("event queue unavailable: {error}").into())
 }
 
 #[cfg(test)]
