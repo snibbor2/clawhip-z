@@ -4,11 +4,12 @@
 
 ## Design Principles
 
-1. **Everything is a plugin** — no hardcoded integrations
-2. **Events are the universal language** — all data flows as typed events
-3. **Providers are swappable** — Discord today, Slack tomorrow, both next week
+1. **Small traits, clear boundaries** — Source, Renderer, Sink, Router are separate concerns
+2. **Events are the universal language** — strongly-typed event envelopes with typed bodies
+3. **Sinks are swappable** — Discord today, Slack tomorrow, both next week
 4. **Local-first** — daemon runs on your machine, no cloud dependency
 5. **Zero-config defaults** — works out of the box, scales with config
+6. **Incremental migration** — every step is shippable; no big-bang refactor
 
 ## Current Architecture (v0.2.0)
 
@@ -25,94 +26,104 @@
 ```
 
 **Problems:**
-- `DiscordClient` is hardcoded everywhere
+- `DiscordClient` hardcoded in router dispatch + monitor loop
 - Router returns `DeliveryTarget::Channel | Webhook` — Discord-specific
-- Monitor dispatches directly to Discord
-- No way to add Slack/Notion without duplicating everything
-- Events are stringly-typed (`kind: String`)
-- No project/session state persistence
+- Single-match routing: `route_for()` uses `.find()`, only one target per event
+- Events are stringly-typed (`kind: String`, `payload: Value`)
+- Duplicate tmux monitoring in `monitor.rs` and `tmux_wrapper.rs`
+- Dead code: `watch.rs`, `server.rs` not wired into module tree
 
-## Target Architecture (v0.3.0 — Claw OS)
+## Target Architecture (v0.3.0)
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│                         clawhip daemon                           │
-│                                                                  │
-│  ┌──────────────┐    ┌──────────────┐    ┌───────────────────┐  │
-│  │ Event Sources │───→│  Event Bus   │───→│ Channel Providers │  │
-│  └──────────────┘    └──────┬───────┘    └───────────────────┘  │
-│                              │                                   │
-│  ┌──────────────┐    ┌──────┴───────┐    ┌───────────────────┐  │
-│  │   Inbound    │───→│    Router    │───→│    Outbound       │  │
-│  │  Providers   │    │  (rules +    │    │   Providers       │  │
-│  │              │    │   filters)   │    │                   │  │
-│  └──────────────┘    └──────────────┘    └───────────────────┘  │
-│                                                                  │
-│  ┌──────────────┐    ┌──────────────┐    ┌───────────────────┐  │
-│  │ Session Mgr  │    │ Project Store│    │  Agent Runtime    │  │
-│  └──────────────┘    └──────────────┘    └───────────────────┘  │
-└──────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│                      clawhip daemon                       │
+│                                                           │
+│  ┌──────────┐     ┌──────────┐     ┌──────────────────┐  │
+│  │ Sources   │────→│  mpsc    │────→│   Dispatcher     │  │
+│  │           │     │  queue   │     │                  │  │
+│  │ • Git     │     └──────────┘     │  Route resolve   │  │
+│  │ • GitHub  │                      │  → 0..N matches  │  │
+│  │ • tmux    │                      │  → render each   │  │
+│  │ • Agent   │                      │  → deliver each  │  │
+│  │ • HTTP in │                      └────────┬─────────┘  │
+│  └──────────┘                                │            │
+│                                     ┌────────┴─────────┐  │
+│                                     │      Sinks       │  │
+│                                     │  • Discord       │  │
+│                                     │  • (Slack 0.4+)  │  │
+│                                     └──────────────────┘  │
+│                                                           │
+│  ┌──────────────────────────────────────────────────┐     │
+│  │  Optional: broadcast mirror for observability    │     │
+│  └──────────────────────────────────────────────────┘     │
+└──────────────────────────────────────────────────────────┘
 ```
 
 ## Core Abstractions
 
-### 1. Event (`crate::event::Event`)
+### 1. Event Model (`crate::event`)
 
-All data flows as strongly-typed events with a common envelope:
+Strongly-typed event envelopes with typed bodies — no more stringly-typed kind + untyped payload:
 
 ```rust
-pub struct Event {
+pub struct EventEnvelope {
     pub id: Uuid,
     pub timestamp: DateTime<Utc>,
-    pub source: EventSource,
-    pub kind: EventKind,
-    pub payload: Value,
+    pub source: SourceId,
+    pub body: EventBody,
     pub metadata: EventMetadata,
 }
 
-pub enum EventSource {
-    Git { repo: String },
-    GitHub { repo: String },
-    Tmux { session: String, pane: String },
-    Agent { session: String, engine: AgentEngine },
-    Inbound { provider: String },
-    System,
+/// Typed event bodies — each variant carries its own typed struct.
+pub enum EventBody {
+    // Git
+    GitCommit(GitCommitEvent),
+    GitCommitAggregated(GitCommitAggregatedEvent),
+    GitBranchChanged(GitBranchChangedEvent),
+
+    // GitHub
+    GitHubIssueOpened(GitHubIssueEvent),
+    GitHubPROpened(GitHubPREvent),
+    GitHubPRMerged(GitHubPREvent),
+    GitHubPRStatusChanged(GitHubPRStatusEvent),
+    GitHubCIFailed(GitHubCIEvent),
+
+    // tmux
+    TmuxKeyword(TmuxKeywordEvent),
+    TmuxKeywordAggregated(TmuxKeywordAggregatedEvent),
+    TmuxStale(TmuxStaleEvent),
+
+    // Agent lifecycle
+    AgentStarted(AgentEvent),
+    AgentBlocked(AgentEvent),
+    AgentFinished(AgentEvent),
+    AgentFailed(AgentEvent),
+
+    // Custom (escape hatch — JSON payload for user events)
+    Custom(CustomEvent),
 }
 
-pub enum EventKind {
-    // Git
-    GitCommit,
-    GitBranchChanged,
-    GitPushAggregated,
-    
-    // GitHub
-    GitHubIssueOpened,
-    GitHubPROpened,
-    GitHubPRMerged,
-    GitHubPRStatusChanged,
-    GitHubCIFailed,
-    
-    // tmux
-    TmuxKeyword,
-    TmuxStale,
-    
-    // Agent lifecycle
-    AgentStarted,
-    AgentBlocked,
-    AgentFinished,
-    AgentFailed,
-    
-    // Session management
-    SessionCreated,
-    SessionCompleted,
-    SessionStale,
-    
-    // Custom
-    Custom(String),
+// Example typed body:
+pub struct GitCommitEvent {
+    pub repo: String,
+    pub branch: String,
+    pub sha: String,
+    pub summary: String,
+}
+
+pub struct TmuxKeywordEvent {
+    pub session: String,
+    pub keyword: String,
+    pub line: String,
+}
+
+pub struct CustomEvent {
+    pub message: String,
+    pub payload: Option<Value>,  // only Custom keeps dynamic JSON
 }
 
 pub struct EventMetadata {
-    pub project: Option<String>,
     pub channel_hint: Option<String>,
     pub mention: Option<String>,
     pub format: Option<MessageFormat>,
@@ -121,186 +132,189 @@ pub struct EventMetadata {
 
 pub enum EventPriority {
     Low,      // routine updates
-    Normal,   // standard notifications
+    Normal,   // standard notifications  
     High,     // failures, blockers
-    Critical, // system down, data loss
+    Critical, // system down
 }
 ```
 
-### 2. Provider Trait (`crate::provider::Provider`)
+**Key decision:** `Custom` variant is the only one with dynamic `Value`. All built-in events use typed structs. This makes routing filters type-safe for built-in events.
 
-All external integrations implement this trait:
+### 2. Source Trait (`crate::source`)
 
-```rust
-#[async_trait]
-pub trait Provider: Send + Sync {
-    /// Unique provider name (e.g. "discord", "slack", "notion")
-    fn name(&self) -> &str;
-
-    /// Provider capabilities
-    fn capabilities(&self) -> ProviderCapabilities;
-
-    /// Initialize from config
-    async fn init(config: &ProviderConfig) -> Result<Self> where Self: Sized;
-
-    /// Send a message/notification (outbound)
-    async fn send(&self, target: &str, message: &RenderedMessage) -> Result<()>;
-
-    /// Format an event for this provider
-    fn render(&self, event: &Event, format: &MessageFormat) -> Result<RenderedMessage>;
-}
-
-pub struct ProviderCapabilities {
-    pub outbound: bool,           // can send messages
-    pub inbound: bool,            // can receive events (webhooks)
-    pub reactions: bool,          // supports emoji reactions
-    pub threads: bool,            // supports threaded replies
-    pub rich_formatting: bool,    // supports embeds/blocks
-    pub bidirectional_sync: bool, // can sync state (Notion/Jira)
-}
-
-pub struct RenderedMessage {
-    pub text: String,
-    pub rich: Option<Value>,  // provider-specific rich format (embeds, blocks)
-}
-```
-
-### 3. Event Source Trait (`crate::source::EventSource`)
-
-Monitors that produce events:
+Monitors that produce events. Each source owns its polling loop:
 
 ```rust
 #[async_trait]
-pub trait EventSource: Send + Sync {
+pub trait Source: Send + Sync {
     fn name(&self) -> &str;
-    
-    /// Start polling/watching and emit events through the bus
-    async fn run(&self, bus: EventBus) -> Result<()>;
-    
-    /// One-shot check (for CLI commands)
-    async fn check(&self) -> Result<Vec<Event>>;
+
+    /// Start polling/watching, emit events into the sender.
+    async fn run(&self, tx: mpsc::Sender<EventEnvelope>) -> Result<()>;
 }
 ```
 
 **Built-in sources:**
 - `GitSource` — local git repo polling (commits, branches)
-- `GitHubSource` — GitHub API polling (PRs, issues, CI)
-- `TmuxSource` — tmux pane monitoring (keywords, stale)
+- `GitHubSource` — GitHub API polling (PRs, issues, CI status)  
+- `TmuxSource` — tmux pane monitoring (keywords, stale) — **consolidates monitor.rs + tmux_wrapper.rs**
 - `AgentSource` — OMC/OMX lifecycle events
-- `WebhookSource` — inbound HTTP webhooks
+- `InboundSource` — HTTP webhook receiver
 
-### 4. Router (`crate::router::Router`)
+### 3. Renderer (`crate::render`)
 
-Event → Provider routing with filter chains:
-
-```rust
-pub struct RouteRule {
-    pub event_pattern: String,         // glob: "github.*", "tmux.stale"
-    pub filters: BTreeMap<String, String>,  // payload field matching
-    pub provider: String,              // "discord", "slack", "notion"  
-    pub target: String,                // channel ID, webhook URL, database ID
-    pub format: Option<MessageFormat>,
-    pub mention: Option<String>,
-    pub template: Option<String>,
-    pub priority_override: Option<EventPriority>,
-    pub transform: Option<String>,     // future: event transformation
-}
-```
-
-**Routing flow:**
-```
-Event → match rules → select provider → render message → deliver
-         ↓ (no match)
-    default provider + default channel
-```
-
-**Multi-provider routing** — one event can match multiple rules:
-```toml
-# Same event → Discord + Slack
-[[routes]]
-event = "github.ci-failed"
-provider = "discord"
-target = "1234567890"
-format = "alert"
-
-[[routes]]
-event = "github.ci-failed"
-provider = "slack"
-target = "#ci-alerts"
-format = "alert"
-```
-
-### 5. Event Bus (`crate::bus::EventBus`)
-
-Central pub/sub for decoupling sources from consumers:
+Formats events into messages. Separate from transport:
 
 ```rust
-pub struct EventBus {
-    sender: broadcast::Sender<Event>,
+pub trait Renderer: Send + Sync {
+    /// Render an event for a specific sink type and format.
+    fn render(
+        &self,
+        event: &EventEnvelope,
+        format: &MessageFormat,
+        template: Option<&str>,
+    ) -> Result<RenderedMessage>;
 }
 
-impl EventBus {
-    pub fn emit(&self, event: Event);
-    pub fn subscribe(&self) -> broadcast::Receiver<Event>;
+pub struct RenderedMessage {
+    pub text: String,
+    pub rich: Option<Value>,  // sink-specific rich format (embeds, blocks)
 }
 ```
 
-### 6. Session Manager (`crate::session::SessionManager`)
+**Default renderer** handles all built-in event bodies with compact/alert/inline formats. Sinks can provide their own renderer for platform-specific formatting (e.g., Slack blocks).
 
-Track and orchestrate coding sessions:
+### 4. Sink Trait (`crate::sink`)
+
+Pure transport — accepts a rendered message, delivers it:
 
 ```rust
-pub struct SessionManager {
-    sessions: HashMap<String, SessionState>,
-    store: Box<dyn SessionStore>,
+#[async_trait]
+pub trait Sink: Send + Sync {
+    fn name(&self) -> &str;
+    fn capabilities(&self) -> SinkCapabilities;
+
+    /// Deliver a rendered message to a target.
+    async fn send(&self, target: &SinkTarget, message: &RenderedMessage) -> Result<()>;
 }
 
-pub struct SessionState {
-    pub name: String,
-    pub engine: AgentEngine,       // OMC, OMX
-    pub worktree: PathBuf,
-    pub branch: String,
-    pub issue: Option<u64>,
-    pub status: SessionStatus,
-    pub created_at: DateTime<Utc>,
-    pub last_activity: DateTime<Utc>,
+pub struct SinkCapabilities {
+    pub reactions: bool,
+    pub threads: bool,
+    pub rich_formatting: bool,
 }
 
-pub enum SessionStatus {
-    Running,
-    Idle,
-    Stale,
-    Completed { pr: Option<u64> },
-    Failed { error: String },
-}
-
-pub enum AgentEngine {
-    OMC,
-    OMX,
+/// Sink-specific target — not a generic string.
+pub enum SinkTarget {
+    DiscordChannel(String),
+    DiscordWebhook(String),
+    SlackChannel(String),       // future
+    SlackWebhook(String),       // future
     Custom(String),
 }
 ```
 
-### 7. Project Store (`crate::project::ProjectStore`)
+**Key decision:** `SinkTarget` is an enum, not a generic string. This prevents stringly-typed target bugs and enables validation at config parse time.
 
-Persistent project context memory:
+### 5. Router (`crate::router`)
+
+Event → 0..N resolved deliveries:
 
 ```rust
-pub struct ProjectStore {
-    base_path: PathBuf,  // ~/.clawhip/projects/
+pub struct Router {
+    rules: Vec<RouteRule>,
+    defaults: RouteDefaults,
 }
 
-pub struct ProjectContext {
-    pub name: String,
-    pub repo: String,
-    pub sessions: Vec<SessionSummary>,
-    pub issues: Vec<IssueSummary>,
-    pub notes: Vec<ProjectNote>,
-    pub last_updated: DateTime<Utc>,
+pub struct RouteRule {
+    pub event_pattern: EventPattern,       // typed pattern matching
+    pub filters: Vec<EventFilter>,         // typed field filters
+    pub sink: String,                      // "discord", "slack"
+    pub target: SinkTarget,
+    pub format: Option<MessageFormat>,
+    pub mention: Option<String>,
+    pub template: Option<String>,
+}
+
+pub struct ResolvedDelivery {
+    pub sink: String,
+    pub target: SinkTarget,
+    pub message: RenderedMessage,
+    pub mention: Option<String>,
+}
+
+impl Router {
+    /// Resolve an event to 0..N deliveries.
+    /// Multiple rules can match the same event.
+    pub fn resolve(&self, event: &EventEnvelope) -> Vec<ResolvedDelivery>;
 }
 ```
 
-Stored as local markdown/JSON — can sync to Obsidian (#32).
+### 6. Dispatcher (`crate::dispatch`)
+
+Central coordinator — consumes from mpsc, routes, delivers:
+
+```rust
+pub struct Dispatcher {
+    rx: mpsc::Receiver<EventEnvelope>,
+    router: Router,
+    renderer: Box<dyn Renderer>,
+    sinks: HashMap<String, Box<dyn Sink>>,
+    observer: Option<broadcast::Sender<EventEnvelope>>,  // optional mirror
+}
+
+impl Dispatcher {
+    pub async fn run(&mut self) -> Result<()> {
+        while let Some(event) = self.rx.recv().await {
+            // Optional: mirror to observers
+            if let Some(ref obs) = self.observer {
+                let _ = obs.send(event.clone());
+            }
+
+            let deliveries = self.router.resolve(&event);
+            for delivery in deliveries {
+                if let Some(sink) = self.sinks.get(&delivery.sink) {
+                    if let Err(e) = sink.send(&delivery.target, &delivery.message).await {
+                        eprintln!("delivery failed to {}/{:?}: {e}", delivery.sink, delivery.target);
+                        // best-effort: log and continue, don't fail other deliveries
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+```
+
+## Delivery Semantics
+
+Explicitly defined (not left to implementers):
+
+| Aspect | Behavior |
+|--------|----------|
+| **Ordering** | Per-source FIFO via mpsc. No global ordering across sources. |
+| **Multi-route failure** | Best-effort. Each delivery is independent. One failure doesn't block others. |
+| **Retries** | None in v0.3. Sink errors are logged. Retry/DLQ is v0.4+. |
+| **Deduplication** | Source-level (keyword window dedup already exists). No dispatcher-level dedup. |
+| **Backpressure** | mpsc provides natural backpressure. Slow dispatcher = sources block. |
+| **Idempotency** | Events have UUID. Sinks may use for idempotency if needed. |
+
+## Pipeline Choice: mpsc vs broadcast
+
+| | mpsc (primary) | broadcast (observer) |
+|---|---|---|
+| **Use** | Source → Dispatcher | Dispatcher → debug/metrics/dashboard |
+| **Why** | Single consumer, backpressure, no message loss | Multi-subscriber, non-critical, lag-tolerant |
+| **Failure** | Sources block if dispatcher is slow | Slow observers get lag errors (acceptable) |
+
+## Security Model
+
+| Boundary | Policy |
+|----------|--------|
+| **Dynamic tokens** (`{sh:...}`) | Only evaluated when route has `allow_dynamic_tokens = true` |
+| **Inbound webhooks** | Never trigger dynamic token evaluation |
+| **Sink credentials** | Scoped per-sink in config. Sinks only access their own tokens. |
+| **Templates** | User-controlled. No shell execution unless explicit opt-in. |
 
 ## Config Evolution
 
@@ -308,22 +322,18 @@ Stored as local markdown/JSON — can sync to Obsidian (#32).
 [daemon]
 port = 25294
 
-# Provider configs
+# v0.3: providers.* replaces top-level [discord]
+# Legacy [discord] section still works (auto-mapped)
 [providers.discord]
 token = "..."
 default_channel = "1234567890"
 
-[providers.slack]
-webhook_url = "https://hooks.slack.com/..."
-# or
-token = "xoxb-..."
-default_channel = "#general"
+# Future (v0.4+):
+# [providers.slack]
+# webhook_url = "https://hooks.slack.com/..."
 
-[providers.notion]
-token = "secret_..."
-database_id = "..."
-
-# Event sources
+# Sources replace monitors.*
+# Legacy monitors.* still works (auto-mapped)
 [sources.git]
 poll_interval_secs = 60
 
@@ -340,131 +350,154 @@ keywords = ["panic", "SIGKILL"]
 stale_minutes = 30
 keyword_window_secs = 30
 
-[sources.agent]
-engines = ["omc", "omx"]
-
-# Routes (unchanged syntax, new `provider` field)
+# Routes: new `sink` field (defaults to "discord" for compat)
 [[routes]]
 event = "github.*"
-provider = "discord"
+sink = "discord"
 target = "1234567890"
 mention = "<@bot>"
 
+# Route without sink = discord (backward compat)
 [[routes]]
-event = "github.ci-failed"
-provider = "slack"
-target = "#ci-alerts"
-
-[[routes]]
-event = "github.issues.opened"
-provider = "notion"
-target = "database-id"
-transform = "issue_to_page"
+event = "tmux.stale"
+target = "1234567890"
 ```
 
-## Migration Path (v0.2 → v0.3)
+## Config Migration (v0.2 → v0.3)
 
-1. **Config backward compat** — old `[discord]` section still works, auto-mapped to `[providers.discord]`
-2. **Routes without `provider`** — default to `discord` (current behavior)
-3. **`monitors.*` → `sources.*`** — alias old key names
-4. **Existing `DiscordClient`** → implements `Provider` trait
-5. **No breaking CLI changes** — all new features are additive
+Explicit mapping, backed by tests:
 
-## Implementation Phases
+| v0.2 | v0.3 | Notes |
+|------|------|-------|
+| `[discord].token` | `[providers.discord].token` | Auto-mapped if legacy exists |
+| `[discord].default_channel` | `[providers.discord].default_channel` | |
+| `route.channel` | `route.target` + `sink = "discord"` | SinkTarget::DiscordChannel |
+| `route.webhook` | `route.target` + `sink = "discord"` | SinkTarget::DiscordWebhook |
+| `route` without `sink` | `sink = "discord"` implied | Backward compat default |
+| `[monitors.git]` | `[sources.git]` | Alias |
+| `[monitors.tmux]` | `[sources.tmux]` | Alias |
 
-### Phase 1: Core Abstractions (0.3.0-alpha)
-- [ ] `Event` type + `EventKind` enum (replace stringly-typed events)
-- [ ] `Provider` trait + Discord as first implementation
-- [ ] `EventBus` (broadcast channel)
-- [ ] `EventSource` trait + refactor Git/tmux monitors
-- [ ] Config migration layer (backward compat)
+**Implementation:** Parse old config into old structs, normalize into new internal model. Two separate serde models, not one with optional fields.
 
-### Phase 2: Multi-Provider (0.3.0-beta)
-- [ ] Slack provider (#28)
-- [ ] `provider` field in route config
-- [ ] Multi-route delivery (one event → multiple providers)
-- [ ] Provider-specific message rendering
+**Required golden tests:**
+- Old Discord-only config parses correctly
+- Mixed legacy + new config
+- Routes without sink field
+- Routes with webhook target
+- Conflicting legacy/new fields → clear error
+- monitors → sources alias
 
-### Phase 3: Session + State (0.3.0)
-- [ ] `SessionManager` — track active coding sessions
-- [ ] `ProjectStore` — persistent project context
-- [ ] Agent lifecycle events (OMC/OMX)
-- [ ] Context-aware keyword filtering (#39)
+## Cleanup Before Refactor
 
-### Phase 4: Bidirectional Sync (0.4.0+)
-- [ ] Notion provider (#29) — issue ↔ page sync
-- [ ] Jira provider (#31) — issue ↔ ticket sync
-- [ ] Obsidian sync (#32) — markdown export
-- [ ] Inbound event processing (Notion → GitHub)
+**Remove/quarantine before v0.3 implementation:**
+- `src/watch.rs` — dead alternate architecture, not in module tree
+- `src/server.rs` — unused, not wired
+- Consolidate tmux monitoring: `monitor.rs` tmux logic + `tmux_wrapper.rs` monitor logic → single `TmuxSource`
 
-### Phase 5: Orchestration (0.5.0+)
-- [ ] Work queue — issue → session auto-assignment
-- [ ] Session auto-spawn from events
-- [ ] Dashboard (TUI or web)
-- [ ] OpenClaw/Clawdbot deep integration
+## Implementation Phases (Vertical Slices)
 
-## File Structure (Target)
+Each phase is independently shippable and testable:
+
+### Phase 1: Internal Event Model
+- [ ] Define `EventEnvelope`, `EventBody` enum with typed structs
+- [ ] Wrap current `IncomingEvent` → `EventEnvelope` at ingress boundary
+- [ ] Keep all external behavior identical
+- [ ] Remove `watch.rs` and `server.rs`
+
+### Phase 2: Router Generalization  
+- [ ] Router resolves 0..N deliveries (not single `.find()`)
+- [ ] `ResolvedDelivery` with `SinkTarget` enum
+- [ ] Discord still the only sink
+- [ ] Tests for multi-match behavior
+
+### Phase 3: Source Extraction
+- [ ] `Source` trait + `mpsc` pipeline
+- [ ] `GitSource` — extract from `monitor.rs`
+- [ ] `TmuxSource` — consolidate `monitor.rs` + `tmux_wrapper.rs`
+- [ ] `GitHubSource` — extract GitHub API polling
+- [ ] Dispatcher consumes from mpsc, replaces direct monitor→router→discord calls
+
+### Phase 4: Sink Extraction + Renderer
+- [ ] `Sink` trait with `DiscordSink` as first implementation
+- [ ] `Renderer` trait with default implementation
+- [ ] Config migration layer (`[discord]` → `[providers.discord]`)
+- [ ] `sink` field in route config (default: "discord")
+
+### Phase 5: Second Sink (v0.4+)
+- [ ] Slack sink (#28)
+- [ ] Slack-specific renderer (blocks format)
+- [ ] Multi-sink delivery tested end-to-end
+
+### Phase 6: State + Orchestration (v0.5+)
+- [ ] SessionManager — track active coding sessions
+- [ ] ProjectStore — persistent project context
+- [ ] Notion/Jira sinks (#29, #31)
+- [ ] Obsidian sync (#32)
+- [ ] Work queue / auto-spawn
+
+## File Structure (Target v0.3)
 
 ```
 src/
 ├── main.rs
 ├── cli.rs
-├── config.rs              # unified config with migration
-├── daemon.rs              # HTTP server + lifecycle
+├── config/
+│   ├── mod.rs           # unified config
+│   ├── legacy.rs        # v0.2 compat parsing
+│   └── migration.rs     # old → new normalization
+├── daemon.rs
 │
 ├── event/
-│   ├── mod.rs             # Event, EventKind, EventSource
-│   ├── bus.rs             # EventBus (broadcast)
-│   └── render.rs          # default rendering
-│
-├── provider/
-│   ├── mod.rs             # Provider trait
-│   ├── discord.rs         # Discord provider
-│   ├── slack.rs           # Slack provider
-│   ├── notion.rs          # Notion provider (future)
-│   └── webhook.rs         # Generic webhook provider
+│   ├── mod.rs           # EventEnvelope, EventBody, EventMetadata
+│   ├── body.rs          # typed event structs
+│   └── compat.rs        # IncomingEvent → EventEnvelope bridge
 │
 ├── source/
-│   ├── mod.rs             # EventSource trait
-│   ├── git.rs             # Git repo monitor
-│   ├── github.rs          # GitHub API monitor
-│   ├── tmux.rs            # tmux pane monitor
-│   ├── agent.rs           # Agent lifecycle
-│   └── inbound.rs         # Inbound webhook receiver
+│   ├── mod.rs           # Source trait
+│   ├── git.rs           # Git repo monitor
+│   ├── github.rs        # GitHub API monitor
+│   ├── tmux.rs          # tmux pane monitor (consolidated)
+│   ├── agent.rs         # Agent lifecycle
+│   └── inbound.rs       # HTTP webhook receiver
 │
 ├── router/
-│   ├── mod.rs             # Router + RouteRule
-│   ├── filter.rs          # Event filtering/matching
-│   └── template.rs        # Dynamic tokens + templates
+│   ├── mod.rs           # Router, RouteRule
+│   ├── filter.rs        # Event pattern matching
+│   └── template.rs      # Dynamic tokens + templates
 │
-├── session/
-│   ├── mod.rs             # SessionManager
-│   └── store.rs           # Persistent session state
+├── render/
+│   ├── mod.rs           # Renderer trait
+│   └── default.rs       # Default compact/alert/inline rendering
 │
-├── project/
-│   ├── mod.rs             # ProjectStore
-│   └── sync.rs            # Obsidian/external sync
+├── sink/
+│   ├── mod.rs           # Sink trait, SinkTarget
+│   └── discord.rs       # Discord sink (bot + webhook)
+│
+├── dispatch.rs          # Dispatcher (mpsc consumer → router → sinks)
 │
 └── util/
     ├── dynamic_tokens.rs
     └── keyword_window.rs
 ```
 
-## Key Decisions
+## Key Decisions Log
 
-1. **Trait objects vs enums for providers** → Trait objects (`Box<dyn Provider>`). Enables runtime plugin loading later. Performance is irrelevant (network I/O dominates).
-
-2. **Event bus implementation** → `tokio::sync::broadcast`. Simple, proven, no external deps. Switch to something heavier only if needed.
-
-3. **Config format** → Stay with TOML. Add `[providers.*]` sections. Old format auto-migrated.
-
-4. **State persistence** → JSON files in `~/.clawhip/state/`. No database. SQLite only if query patterns demand it.
-
-5. **Plugin loading** → Compile-time for now (feature flags). Runtime loading (dylib/WASM) is Phase 5+.
+| # | Decision | Rationale |
+|---|----------|-----------|
+| 1 | **Separate traits: Source, Renderer, Sink** | Provider trait was too fat. Current code naturally separates rendering (events.rs), routing (router.rs), transport (discord.rs). |
+| 2 | **mpsc for primary pipeline** | Single dispatcher consumer. Backpressure. No message loss. broadcast only for observers. |
+| 3 | **Typed event bodies (enum)** | No more stringly-typed kind + untyped payload. Custom variant is the only escape hatch. |
+| 4 | **SinkTarget enum, not generic String** | Prevents stringly-typed target bugs. Enables validation at config parse time. |
+| 5 | **Best-effort multi-delivery** | One failure doesn't block others. Retry/DLQ deferred to v0.4+. |
+| 6 | **Two-model config migration** | Parse legacy into old structs, normalize to new. Not one struct with optional fields everywhere. |
+| 7 | **Vertical slice phases** | Each phase is shippable. No layer-by-layer refactor that blocks shipping. |
+| 8 | **Compile-time sinks only** | No runtime plugin loading until v0.5+. Feature flags for optional sinks. |
+| 9 | **Clean dead code first** | Remove watch.rs, server.rs before adding new abstractions. |
 
 ---
 
 *This is a living document. Updated as implementation progresses.*
+*Revised after architecture self-review (ARCHITECTURE-REVIEW.md).*
 
 —
 *[repo owner's gaebal-gajae (clawdbot) 🦞]*
