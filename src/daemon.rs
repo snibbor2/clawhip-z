@@ -110,7 +110,7 @@ async fn post_event(
         )
             .into_response();
     }
-    match state.router.dispatch(&event, state.discord.as_ref()).await {
+    match dispatch_event(state.router.as_ref(), state.discord.as_ref(), &event).await {
         Ok(()) => (
             StatusCode::ACCEPTED,
             Json(json!({"ok": true, "type": event.kind})),
@@ -180,7 +180,7 @@ async fn post_github(
                 )
                     .into_response();
             }
-            state.router.dispatch(&event, state.discord.as_ref()).await
+            dispatch_event(state.router.as_ref(), state.discord.as_ref(), &event).await
         }
         "pull_request" => {
             let repo = payload
@@ -225,7 +225,7 @@ async fn post_github(
                     )
                         .into_response();
                 }
-                state.router.dispatch(&event, state.discord.as_ref()).await
+                dispatch_event(state.router.as_ref(), state.discord.as_ref(), &event).await
             } else {
                 return (
                     StatusCode::ACCEPTED,
@@ -251,6 +251,23 @@ async fn post_github(
         )
             .into_response(),
     }
+}
+
+async fn dispatch_event(
+    router: &Router,
+    discord: &DiscordClient,
+    event: &IncomingEvent,
+) -> Result<()> {
+    for delivery in router.resolve(event).await? {
+        if let Err(error) = discord.send(&delivery.target, &delivery.content).await {
+            eprintln!(
+                "clawhip daemon delivery failed to {:?}: {error}",
+                delivery.target
+            );
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

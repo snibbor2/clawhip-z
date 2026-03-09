@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use crate::Result;
 use crate::config::{AppConfig, RouteRule};
+#[cfg(test)]
 use crate::discord::DiscordClient;
 use crate::dynamic_tokens;
 use crate::events::{IncomingEvent, MessageFormat};
@@ -13,7 +14,7 @@ pub enum DeliveryTarget {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DeliveryPreview {
+pub struct ResolvedDelivery {
     pub target: DeliveryTarget,
     pub format: MessageFormat,
     pub content: String,
@@ -28,13 +29,51 @@ impl Router {
         Self { config }
     }
 
+    #[cfg(test)]
     pub async fn dispatch(&self, event: &IncomingEvent, discord: &DiscordClient) -> Result<()> {
-        let delivery = self.preview_delivery(event).await?;
-        discord.send(&delivery.target, &delivery.content).await
+        for delivery in self.resolve(event).await? {
+            if let Err(error) = discord.send(&delivery.target, &delivery.content).await {
+                eprintln!(
+                    "clawhip router delivery failed to {:?}: {error}",
+                    delivery.target
+                );
+            }
+        }
+
+        Ok(())
     }
 
-    pub async fn preview_delivery(&self, event: &IncomingEvent) -> Result<DeliveryPreview> {
-        let route = self.route_for(event);
+    pub async fn resolve(&self, event: &IncomingEvent) -> Result<Vec<ResolvedDelivery>> {
+        let routes = self.routes_for(event);
+        let routes = if routes.is_empty() {
+            vec![None]
+        } else {
+            routes.into_iter().map(Some).collect()
+        };
+        let mut deliveries = Vec::with_capacity(routes.len());
+
+        for route in routes {
+            deliveries.push(self.resolve_delivery(event, route).await?);
+        }
+
+        Ok(deliveries)
+    }
+
+    #[cfg(test)]
+    pub async fn preview_delivery(&self, event: &IncomingEvent) -> Result<ResolvedDelivery> {
+        let mut deliveries = self.resolve(event).await?;
+        if deliveries.len() != 1 {
+            return Err(format!("expected exactly one delivery, got {}", deliveries.len()).into());
+        }
+
+        Ok(deliveries.remove(0))
+    }
+
+    async fn resolve_delivery(
+        &self,
+        event: &IncomingEvent,
+        route: Option<&RouteRule>,
+    ) -> Result<ResolvedDelivery> {
         let target = self.target_for(event, route)?;
         let format = event
             .format
@@ -71,7 +110,7 @@ impl Router {
             _ => content,
         };
 
-        Ok(DeliveryPreview {
+        Ok(ResolvedDelivery {
             target,
             format,
             content,
@@ -105,20 +144,24 @@ impl Router {
         false
     }
 
-    fn route_for<'a>(&'a self, event: &IncomingEvent) -> Option<&'a RouteRule> {
+    fn routes_for<'a>(&'a self, event: &IncomingEvent) -> Vec<&'a RouteRule> {
         let context = event.template_context();
         let candidates = route_candidates(event.canonical_kind());
-        self.config.routes.iter().find(|route| {
-            candidates
-                .iter()
-                .any(|candidate| glob_match(&route.event, candidate))
-                && route.filter.iter().all(|(key, expected)| {
-                    context
-                        .get(key)
-                        .map(|actual| glob_match(expected, actual))
-                        .unwrap_or(false)
-                })
-        })
+        self.config
+            .routes
+            .iter()
+            .filter(|route| {
+                candidates
+                    .iter()
+                    .any(|candidate| glob_match(&route.event, candidate))
+                    && route.filter.iter().all(|(key, expected)| {
+                        context
+                            .get(key)
+                            .map(|actual| glob_match(expected, actual))
+                            .unwrap_or(false)
+                    })
+            })
+            .collect()
     }
 
     fn target_for(
@@ -200,6 +243,156 @@ fn glob_match(pattern: &str, value: &str) -> bool {
 mod tests {
     use super::*;
     use crate::config::{DefaultsConfig, RouteRule};
+
+    #[tokio::test]
+    async fn resolve_returns_all_matching_deliveries_in_route_order() {
+        let config = AppConfig {
+            defaults: DefaultsConfig {
+                channel: Some("default".into()),
+                format: MessageFormat::Compact,
+            },
+            routes: vec![
+                RouteRule {
+                    event: "tmux.keyword".into(),
+                    filter: Default::default(),
+                    channel: Some("ops".into()),
+                    webhook: None,
+                    mention: Some("@ops".into()),
+                    allow_dynamic_tokens: false,
+                    format: Some(MessageFormat::Alert),
+                    template: None,
+                },
+                RouteRule {
+                    event: "tmux.*".into(),
+                    filter: Default::default(),
+                    channel: Some("eng".into()),
+                    webhook: None,
+                    mention: Some("@eng".into()),
+                    allow_dynamic_tokens: false,
+                    format: Some(MessageFormat::Compact),
+                    template: Some("duplicate: {line}".into()),
+                },
+            ],
+            ..AppConfig::default()
+        };
+        let router = Router::new(Arc::new(config));
+        let event =
+            IncomingEvent::tmux_keyword("issue-24".into(), "error".into(), "boom".into(), None);
+
+        let deliveries = router.resolve(&event).await.unwrap();
+
+        assert_eq!(deliveries.len(), 2);
+        assert_eq!(deliveries[0].target, DeliveryTarget::Channel("ops".into()));
+        assert_eq!(deliveries[0].format, MessageFormat::Alert);
+        assert!(deliveries[0].content.starts_with("@ops "));
+        assert!(deliveries[0].content.contains("boom"));
+        assert_eq!(deliveries[1].target, DeliveryTarget::Channel("eng".into()));
+        assert_eq!(deliveries[1].format, MessageFormat::Compact);
+        assert_eq!(deliveries[1].content, "@eng duplicate: boom");
+    }
+
+    #[tokio::test]
+    async fn resolve_uses_defaults_when_no_routes_match() {
+        let config = AppConfig {
+            defaults: DefaultsConfig {
+                channel: Some("fallback".into()),
+                format: MessageFormat::Alert,
+            },
+            routes: vec![RouteRule {
+                event: "github.*".into(),
+                filter: Default::default(),
+                channel: Some("github".into()),
+                webhook: None,
+                mention: None,
+                allow_dynamic_tokens: false,
+                format: Some(MessageFormat::Compact),
+                template: None,
+            }],
+            ..AppConfig::default()
+        };
+        let router = Router::new(Arc::new(config));
+        let event = IncomingEvent::custom(None, "wake up".into());
+
+        let deliveries = router.resolve(&event).await.unwrap();
+
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(
+            deliveries[0],
+            ResolvedDelivery {
+                target: DeliveryTarget::Channel("fallback".into()),
+                format: MessageFormat::Alert,
+                content: "🚨 wake up".into(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_best_effort_continues_after_webhook_failure() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::time::{Duration, timeout};
+
+        async fn spawn_webhook(status: &str) -> (String, tokio::task::JoinHandle<String>) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let status_line = status.to_string();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0_u8; 4096];
+                let n = stream.read(&mut buf).await.unwrap();
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let response = format!("HTTP/1.1 {status_line}\r\ncontent-length: 0\r\n\r\n");
+                stream.write_all(response.as_bytes()).await.unwrap();
+                req
+            });
+
+            (format!("http://{addr}/webhook"), server)
+        }
+
+        let (failing_webhook, failing_server) = spawn_webhook("500 Internal Server Error").await;
+        let (successful_webhook, successful_server) = spawn_webhook("204 No Content").await;
+        let config = AppConfig {
+            routes: vec![
+                RouteRule {
+                    event: "tmux.keyword".into(),
+                    filter: Default::default(),
+                    channel: None,
+                    webhook: Some(failing_webhook),
+                    mention: None,
+                    allow_dynamic_tokens: false,
+                    format: None,
+                    template: Some("first".into()),
+                },
+                RouteRule {
+                    event: "tmux.keyword".into(),
+                    filter: Default::default(),
+                    channel: None,
+                    webhook: Some(successful_webhook),
+                    mention: None,
+                    allow_dynamic_tokens: false,
+                    format: None,
+                    template: Some("second".into()),
+                },
+            ],
+            ..AppConfig::default()
+        };
+        let router = Router::new(Arc::new(config));
+        let discord = DiscordClient::from_config(Arc::new(AppConfig::default())).unwrap();
+        let event =
+            IncomingEvent::tmux_keyword("issue-24".into(), "error".into(), "boom".into(), None);
+
+        router.dispatch(&event, &discord).await.unwrap();
+
+        let failing_request = timeout(Duration::from_secs(2), failing_server)
+            .await
+            .unwrap()
+            .unwrap();
+        let successful_request = timeout(Duration::from_secs(2), successful_server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(failing_request.contains("\"content\":\"first\""));
+        assert!(successful_request.contains("\"content\":\"second\""));
+    }
 
     #[tokio::test]
     async fn preview_uses_filtered_route_overrides() {

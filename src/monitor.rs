@@ -574,8 +574,16 @@ async fn dispatch_event(
         }
         _ => event.clone(),
     };
-    let delivery = router.preview_delivery(&event).await?;
-    discord.send(&delivery.target, &delivery.content).await
+    for delivery in router.resolve(&event).await? {
+        if let Err(error) = discord.send(&delivery.target, &delivery.content).await {
+            eprintln!(
+                "clawhip monitor delivery failed to {:?}: {error}",
+                delivery.target
+            );
+        }
+    }
+
+    Ok(())
 }
 
 async fn snapshot_git_repo(repo: &GitRepoMonitor) -> Result<GitSnapshot> {
