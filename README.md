@@ -142,6 +142,24 @@ Operational notes:
 - use plain operational language like "check open PRs/issues", "review blockers", and "continue stalled work"
 - this keeps scheduling outside the agent loop: cron handles timing, clawhip handles delivery, Discord handles the handoff
 
+## Filesystem-offloaded memory pattern
+
+clawhip now documents a Claw OS-style memory pattern where `MEMORY.md` is the hot pointer/index layer and detailed memory lives in structured filesystem shards under `memory/`.
+
+Use this when you want:
+
+- a small, fast memory surface for agents
+- durable project/channel/daily memory in files
+- explicit read/write routing instead of one giant note
+- ongoing memory refactoring as part of operations
+
+Start here:
+
+- [docs/memory-offload-architecture.md](docs/memory-offload-architecture.md)
+- [docs/memory-offload-guide.md](docs/memory-offload-guide.md)
+- [docs/examples/MEMORY.example.md](docs/examples/MEMORY.example.md)
+- [skills/memory-offload/SKILL.md](skills/memory-offload/SKILL.md)
+
 ## Plugin architecture
 
 clawhip now includes a simple `plugins/` directory for tool-specific shell bridges.

@@ -137,6 +137,21 @@ Allowed dynamic tokens:
 - `{now}`
 - `{iso_time}`
 
+## Filesystem-offloaded memory pattern
+
+When using clawhip as part of a broader Claw OS workflow, treat memory as an offloaded filesystem tree:
+
+- `MEMORY.md` = small pointer/index/current-beliefs layer
+- `memory/` = detailed project/channel/daily/handoff memory
+- update root memory only when the map or current summary changes
+
+Read before adopting this pattern:
+
+- `docs/memory-offload-architecture.md`
+- `docs/memory-offload-guide.md`
+- `docs/examples/MEMORY.example.md`
+- `skills/memory-offload/SKILL.md`
+
 ## Verification surface
 
 Use the live operational runbook:
