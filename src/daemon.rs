@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::extract::State;
@@ -13,14 +14,16 @@ use tokio::sync::{RwLock, mpsc};
 use crate::Result;
 use crate::VERSION;
 use crate::config::AppConfig;
+use crate::cron::CronSource;
 use crate::dispatch::Dispatcher;
-use crate::event::compat::from_incoming_event;
+use crate::event::compat::{from_incoming_event, incoming_event_from_omx_hook_envelope_json};
 use crate::events::{IncomingEvent, normalize_event};
 use crate::render::{DefaultRenderer, Renderer};
 use crate::router::Router;
 use crate::sink::{DiscordSink, Sink, SlackSink};
 use crate::source::{
     GitHubSource, GitSource, RegisteredTmuxSession, SharedTmuxRegistry, Source, TmuxSource,
+    WorkspaceSource, list_active_tmux_registrations,
 };
 
 const EVENT_QUEUE_CAPACITY: usize = 256;
@@ -33,7 +36,11 @@ struct AppState {
     tmux_registry: SharedTmuxRegistry,
 }
 
-pub async fn run(config: Arc<AppConfig>, port_override: Option<u16>) -> Result<()> {
+pub async fn run(
+    config: Arc<AppConfig>,
+    port_override: Option<u16>,
+    cron_state_path: PathBuf,
+) -> Result<()> {
     config.validate()?;
     let token_source = config.discord_token_source();
     println!("clawhip v{VERSION} starting (token_source: {token_source})");
@@ -49,8 +56,9 @@ pub async fn run(config: Arc<AppConfig>, port_override: Option<u16>) -> Result<(
     let tmux_registry: SharedTmuxRegistry = Arc::new(RwLock::new(HashMap::new()));
     let (tx, rx) = mpsc::channel(EVENT_QUEUE_CAPACITY);
 
+    let ci_batch_window = config.dispatch.ci_batch_window();
     tokio::spawn(async move {
-        let mut dispatcher = Dispatcher::new(rx, router, renderer, sinks);
+        let mut dispatcher = Dispatcher::new(rx, router, renderer, sinks, ci_batch_window);
         if let Err(error) = dispatcher.run().await {
             eprintln!("clawhip dispatcher stopped: {error}");
         }
@@ -61,6 +69,8 @@ pub async fn run(config: Arc<AppConfig>, port_override: Option<u16>) -> Result<(
         TmuxSource::new(config.clone(), tmux_registry.clone()),
         tx.clone(),
     );
+    spawn_source(WorkspaceSource::new(config.clone()), tx.clone());
+    spawn_source(CronSource::new(config.clone(), cron_state_path), tx.clone());
 
     let app = AxumRouter::new()
         .route("/health", get(health))
@@ -68,7 +78,10 @@ pub async fn run(config: Arc<AppConfig>, port_override: Option<u16>) -> Result<(
         .route("/event", post(post_event))
         .route("/api/event", post(post_event))
         .route("/events", post(post_event))
+        .route("/omx/hook", post(post_omx_hook))
+        .route("/api/omx/hook", post(post_omx_hook))
         .route("/api/tmux/register", post(register_tmux))
+        .route("/api/tmux", get(list_tmux))
         .route("/github", post(post_github));
     let port = port_override.unwrap_or(config.daemon.port);
 
@@ -119,6 +132,8 @@ fn health_payload(config: &AppConfig, port: u16, registered_tmux_sessions: usize
         "daemon_base_url": config.daemon.base_url,
         "configured_git_monitors": config.monitors.git.repos.len(),
         "configured_tmux_monitors": config.monitors.tmux.sessions.len(),
+        "configured_workspace_monitors": config.monitors.workspace.len(),
+        "configured_cron_jobs": config.cron.jobs.len(),
         "registered_tmux_sessions": registered_tmux_sessions,
     })
 }
@@ -131,7 +146,28 @@ async fn post_event(
     State(state): State<AppState>,
     Json(event): Json<IncomingEvent>,
 ) -> impl IntoResponse {
-    let event = normalize_event(event);
+    accept_event(&state, normalize_event(event)).await
+}
+
+async fn post_omx_hook(
+    State(state): State<AppState>,
+    Json(payload): Json<Value>,
+) -> impl IntoResponse {
+    let event = match incoming_event_from_omx_hook_envelope_json(&payload) {
+        Ok(event) => normalize_event(event),
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"ok": false, "error": error.to_string()})),
+            )
+                .into_response();
+        }
+    };
+
+    accept_event(&state, event).await
+}
+
+async fn accept_event(state: &AppState, event: IncomingEvent) -> axum::response::Response {
     let envelope = match from_incoming_event(&event) {
         Ok(envelope) => envelope,
         Err(error) => {
@@ -175,6 +211,17 @@ async fn register_tmux(
         Json(json!({"ok": true, "session": registration.session})),
     )
         .into_response()
+}
+
+async fn list_tmux(State(state): State<AppState>) -> impl IntoResponse {
+    match list_active_tmux_registrations(state.config.as_ref(), &state.tmux_registry).await {
+        Ok(registrations) => (StatusCode::OK, Json(json!(registrations))).into_response(),
+        Err(error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"ok": false, "error": error.to_string()})),
+        )
+            .into_response(),
+    }
 }
 
 async fn post_github(
@@ -298,6 +345,7 @@ async fn enqueue_event(tx: &mpsc::Sender<IncomingEvent>, event: IncomingEvent) -
 mod tests {
     use super::*;
     use crate::config::AppConfig;
+    use crate::source::tmux::{ParentProcessInfo, RegistrationSource};
     use axum::body::to_bytes;
 
     #[test]
@@ -306,6 +354,7 @@ mod tests {
         config.providers.discord.bot_token = Some("config-token".into());
         config.monitors.git.repos.push(Default::default());
         config.monitors.tmux.sessions.push(Default::default());
+        config.monitors.workspace.push(Default::default());
 
         let payload = health_payload(&config, 25294, 3);
 
@@ -315,6 +364,7 @@ mod tests {
         assert_eq!(payload["port"], Value::from(25294));
         assert_eq!(payload["configured_git_monitors"], Value::from(1));
         assert_eq!(payload["configured_tmux_monitors"], Value::from(1));
+        assert_eq!(payload["configured_workspace_monitors"], Value::from(1));
         assert_eq!(payload["registered_tmux_sessions"], Value::from(3));
     }
 
@@ -355,6 +405,135 @@ mod tests {
                 .get("first_seen_at")
                 .and_then(Value::as_str)
                 .is_some_and(|value| !value.is_empty())
+        );
+    }
+
+    #[tokio::test]
+    async fn post_omx_hook_accepts_native_hook_envelope_and_queues_normalized_event() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let state = AppState {
+            config: Arc::new(AppConfig::default()),
+            port: 25294,
+            tx,
+            tmux_registry: Arc::new(RwLock::new(HashMap::new())),
+        };
+        let payload = json!({
+            "schema_version": "1",
+            "event": "session-start",
+            "timestamp": "2026-04-01T22:00:00Z",
+            "context": {
+                "normalized_event": "started",
+                "agent_name": "omx",
+                "session_name": "issue-65-native-sdk",
+                "status": "started",
+                "repo_path": "/repo/clawhip",
+                "branch": "feat/issue-65-native-sdk"
+            }
+        });
+
+        let response = post_omx_hook(State(state), Json(payload))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let response_json: Value = serde_json::from_slice(&body).unwrap();
+        let event_id = response_json["event_id"].as_str().unwrap();
+        assert!(!event_id.is_empty());
+        assert_eq!(response_json["type"], Value::from("session.started"));
+
+        let queued = rx.recv().await.unwrap();
+        assert_eq!(queued.kind, "session.started");
+        assert_eq!(queued.payload["tool"], Value::from("omx"));
+        assert_eq!(
+            queued.payload["session_name"],
+            Value::from("issue-65-native-sdk")
+        );
+        assert_eq!(queued.payload["event_id"], Value::from(event_id));
+    }
+
+    #[tokio::test]
+    async fn post_omx_hook_rejects_missing_normalized_event() {
+        let (tx, _rx) = mpsc::channel(1);
+        let state = AppState {
+            config: Arc::new(AppConfig::default()),
+            port: 25294,
+            tx,
+            tmux_registry: Arc::new(RwLock::new(HashMap::new())),
+        };
+        let payload = json!({
+            "schema_version": "1",
+            "event": "session-start",
+            "context": {
+                "agent_name": "omx",
+                "status": "started"
+            }
+        });
+
+        let response = post_omx_hook(State(state), Json(payload))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let response_json: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            response_json["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("context.normalized_event"))
+        );
+    }
+
+    #[tokio::test]
+    async fn list_tmux_returns_registered_sessions_with_metadata() {
+        let (tx, _rx) = mpsc::channel(1);
+        let registry: SharedTmuxRegistry = Arc::new(RwLock::new(HashMap::new()));
+        registry.write().await.insert(
+            "issue-105".into(),
+            RegisteredTmuxSession {
+                session: "issue-105".into(),
+                channel: Some("alerts".into()),
+                mention: Some("<@123>".into()),
+                keywords: vec!["error".into()],
+                keyword_window_secs: 30,
+                stale_minutes: 15,
+                format: None,
+                registered_at: "2026-04-02T00:00:00Z".into(),
+                registration_source: RegistrationSource::CliWatch,
+                parent_process: Some(ParentProcessInfo {
+                    pid: 4242,
+                    name: Some("codex".into()),
+                }),
+                active_wrapper_monitor: true,
+            },
+        );
+        let state = AppState {
+            config: Arc::new(AppConfig::default()),
+            port: 25294,
+            tx,
+            tmux_registry: registry,
+        };
+
+        let response = list_tmux(State(state)).await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let response_json: Value = serde_json::from_slice(&body).unwrap();
+        let registrations = response_json.as_array().unwrap();
+        assert_eq!(registrations.len(), 1);
+        assert_eq!(registrations[0]["session"], Value::from("issue-105"));
+        assert_eq!(
+            registrations[0]["registration_source"],
+            Value::from("cli-watch")
+        );
+        assert_eq!(
+            registrations[0]["registered_at"],
+            Value::from("2026-04-02T00:00:00Z")
+        );
+        assert_eq!(registrations[0]["parent_process"]["pid"], Value::from(4242));
+        assert_eq!(
+            registrations[0]["parent_process"]["name"],
+            Value::from("codex")
         );
     }
 }

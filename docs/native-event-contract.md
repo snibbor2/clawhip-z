@@ -1,5 +1,7 @@
 # Native OMC / OMX Event Contract
 
+> Frozen contract reference: see [docs/event-contract-v1.md](event-contract-v1.md) for the stable v1 wire-format specification. This document remains the higher-level routing and migration guide.
+
 This document is the clawhip-side normalization contract for native OMC/OMX operational events.
 
 ## Goal
@@ -37,9 +39,13 @@ clawhip normalizes already-merged OMC/OMX payloads from these upstream surfaces:
 
 - OMC payloads that include `signal.routeKey`
 - OMX payloads that include `context.normalized_event`
+- native OMX hook-envelope CLI ingress via `clawhip omx hook`
+- native OMX hook-envelope POSTs to clawhip's `/api/omx/hook` / `/omx/hook` ingress
 - legacy local `clawhip emit agent.* ...` wrapper emits from `skills/omc/create.sh` and `skills/omx/create.sh`
 
 Not every upstream raw event becomes a canonical session event. Low-signal/raw hook events should stay as secondary/debug inputs. New routes should target `session.*`.
+
+In particular, raw OMX hook events such as `pre-tool-use` / `post-tool-use` are not clawhip v1 canonical route keys. When OMX wants clawhip-native routing for tool activity, it should map the activity onto an existing v1 event family (`session.failed`, `session.test-*`, `session.pr-created`, etc.) and keep tool details in metadata like `command`, `tool_name`, and `error_summary`.
 
 ## Normalized metadata
 
@@ -75,6 +81,7 @@ When upstream provides it, clawhip normalizes these fields onto the top-level pa
 - `pr_number` may be inferred from `pr_url`.
 - `raw_event` is retained only when clawhip had to rename the incoming event.
 - `contract_event` is the canonical normalized event after clawhip ingestion.
+- raw OMX tool events such as `pre-tool-use` / `post-tool-use` are not new clawhip v1 canonical events; map them to the frozen `session.*` family via metadata when they represent PR/test/failure/handoff semantics.
 
 ## Upstream-to-canonical mapping
 
@@ -131,6 +138,17 @@ Prefer filters on structured metadata such as:
 
 Avoid routing on rendered message text.
 
+### Operator rails
+
+For native OMC/OMX routing, treat these as the non-negotiable defaults:
+
+- route native session traffic on `session.*` first; keep `agent.*` only for compatibility with older local wrapper emits
+- filter native session traffic on `repo_name`, not `repo`
+- if you also filter by tool, use `tool = "omx"` or `tool = "omc"`
+- if a native session route misses and `[defaults].channel` is configured, clawhip can still deliver to that default channel; wrong-channel delivery usually means route mismatch, not transport failure
+
+`repo` is still common on git/GitHub payloads, but the native OMC/OMX normalization contract promotes `repo_name` onto the top-level session payload. That is why a route like `filter = { tool = "omx", repo = "clawhip" }` can keep matching GitHub/git events while missing native session traffic.
+
 ## Formatting guidance
 
 Default clawhip session formatting is intentionally low-noise:
@@ -149,7 +167,8 @@ Direct platform notifications from inside OMC/OMX are deprecated for clawhip-int
 Preferred model:
 
 1. OMC/OMX emit native operational events
-2. clawhip normalizes them
-3. clawhip owns channel routing, mentions, formatting, and webhook delivery
+2. clawhip ingests them directly (for OMX, `clawhip omx hook` and `/api/omx/hook` are the native ingress surfaces)
+3. clawhip normalizes them
+4. clawhip owns channel routing, mentions, formatting, and webhook delivery
 
 That keeps notification policy in one place and avoids duplicate/noisy Discord or Slack messages.

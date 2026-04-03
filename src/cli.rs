@@ -1,8 +1,8 @@
+use std::io::Read;
 use std::path::PathBuf;
 
-use serde_json::Value;
-
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
+use serde_json::Value;
 
 use crate::events::MessageFormat;
 
@@ -34,7 +34,7 @@ impl Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Commands {
-    /// Start the daemon (HTTP server + git/tmux monitors).
+    /// Start the daemon (HTTP server + monitors + managed cron jobs).
     #[command(alias = "serve")]
     Start {
         #[arg(long)]
@@ -75,6 +75,16 @@ pub enum Commands {
     Tmux {
         #[command(subcommand)]
         command: TmuxCommands,
+    },
+    /// Send native OMX hook-envelope events to the local daemon.
+    Omx {
+        #[command(subcommand)]
+        command: OmxCommands,
+    },
+    /// Run configured cron jobs via clawhip.
+    Cron {
+        #[command(subcommand)]
+        command: CronCommands,
     },
     /// Install clawhip from the current git clone.
     Install {
@@ -281,6 +291,62 @@ pub enum PluginCommands {
     List,
 }
 
+#[derive(Debug, Clone, Subcommand)]
+pub enum OmxCommands {
+    /// Forward an OMX v1 hook envelope to clawhip.
+    Hook(OmxHookArgs),
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum CronCommands {
+    /// Run one configured cron job immediately, which is useful for native system-cron entrypoints.
+    Run {
+        /// Cron job id from [[cron.jobs]].id.
+        id: String,
+    },
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct OmxHookArgs {
+    /// Provide the hook-envelope JSON inline.
+    #[arg(long)]
+    pub payload: Option<String>,
+    /// Read hook-envelope JSON from a file. Use "-" or omit to read stdin.
+    #[arg(long)]
+    pub file: Option<PathBuf>,
+}
+
+#[cfg_attr(test, allow(dead_code))]
+impl OmxHookArgs {
+    pub fn read_payload(&self, stdin: &mut dyn Read) -> crate::Result<serde_json::Value> {
+        match (&self.payload, &self.file) {
+            (Some(_), Some(_)) => {
+                Err("provide either --payload or --file for clawhip omx hook, not both".into())
+            }
+            (Some(payload), None) => Ok(serde_json::from_str(payload)?),
+            (None, Some(path)) => {
+                if path.as_os_str() == "-" {
+                    return Self::read_payload_from_stdin(stdin);
+                }
+                Ok(serde_json::from_str(&std::fs::read_to_string(path)?)?)
+            }
+            (None, None) => Self::read_payload_from_stdin(stdin),
+        }
+    }
+
+    fn read_payload_from_stdin(stdin: &mut dyn Read) -> crate::Result<serde_json::Value> {
+        let mut buffer = String::new();
+        stdin.read_to_string(&mut buffer)?;
+        let trimmed = buffer.trim();
+        if trimmed.is_empty() {
+            return Err(
+                "clawhip omx hook expects a JSON payload via stdin, --payload, or --file".into(),
+            );
+        }
+        Ok(serde_json::from_str(trimmed)?)
+    }
+}
+
 #[derive(Debug, Subcommand)]
 pub enum TmuxCommands {
     Keyword {
@@ -307,6 +373,8 @@ pub enum TmuxCommands {
     },
     New(TmuxNewArgs),
     Watch(TmuxWatchArgs),
+    /// List active tmux watch registrations known to the daemon.
+    List,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -655,6 +723,17 @@ mod tests {
     }
 
     #[test]
+    fn parses_tmux_list_subcommand() {
+        let cli = Cli::parse_from(["clawhip", "tmux", "list"]);
+
+        let Commands::Tmux { command } = cli.command.expect("tmux command") else {
+            panic!("expected tmux command");
+        };
+
+        assert!(matches!(command, TmuxCommands::List));
+    }
+
+    #[test]
     fn parses_setup_webhook_subcommand() {
         let cli = Cli::parse_from([
             "clawhip",
@@ -738,6 +817,72 @@ mod tests {
         };
 
         assert!(matches!(command, PluginCommands::List));
+    }
+
+    #[test]
+    fn parses_omx_hook_subcommand() {
+        let cli = Cli::parse_from(["clawhip", "omx", "hook", "--file", "payload.json"]);
+
+        let Commands::Omx { command } = cli.command.expect("omx command") else {
+            panic!("expected omx command");
+        };
+
+        let OmxCommands::Hook(args) = command;
+
+        assert_eq!(
+            args.file.as_deref(),
+            Some(PathBuf::from("payload.json").as_path())
+        );
+    }
+
+    #[test]
+    fn parses_cron_run_subcommand() {
+        let cli = Cli::parse_from(["clawhip", "cron", "run", "dev-followup"]);
+
+        let Commands::Cron { command } = cli.command.expect("cron command") else {
+            panic!("expected cron command");
+        };
+        let CronCommands::Run { id } = command;
+
+        assert_eq!(id, "dev-followup");
+    }
+
+    #[test]
+    fn omx_hook_args_read_payload_from_inline_json() {
+        let args = OmxHookArgs {
+            payload: Some(
+                r#"{"schema_version":"1","context":{"normalized_event":"started"}}"#.into(),
+            ),
+            file: None,
+        };
+
+        let payload = args
+            .read_payload(&mut std::io::Cursor::new(Vec::<u8>::new()))
+            .expect("inline json payload");
+
+        assert_eq!(payload["schema_version"], serde_json::json!("1"));
+        assert_eq!(
+            payload["context"]["normalized_event"],
+            serde_json::json!("started")
+        );
+    }
+
+    #[test]
+    fn omx_hook_args_reject_empty_input() {
+        let args = OmxHookArgs {
+            payload: None,
+            file: None,
+        };
+
+        let error = args
+            .read_payload(&mut std::io::Cursor::new(Vec::<u8>::new()))
+            .expect_err("empty stdin should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("clawhip omx hook expects a JSON payload")
+        );
     }
 
     #[test]

@@ -25,10 +25,29 @@ impl DaemonClient {
         self.post_json("/event", event).await.map(|_| ())
     }
 
+    pub async fn send_omx_hook(&self, envelope: &Value) -> Result<Value> {
+        self.post_json("/api/omx/hook", envelope).await
+    }
+
     pub async fn register_tmux(&self, registration: &RegisteredTmuxSession) -> Result<()> {
         self.post_json("/api/tmux/register", registration)
             .await
             .map(|_| ())
+    }
+
+    pub async fn list_tmux(&self) -> Result<Vec<RegisteredTmuxSession>> {
+        let response = self
+            .http
+            .get(format!("{}/api/tmux", self.base_url))
+            .send()
+            .await?;
+        if response.status().is_success() {
+            Ok(response.json().await?)
+        } else {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            Err(format!("daemon tmux list failed with {status}: {body}").into())
+        }
     }
 
     pub async fn health(&self) -> Result<Value> {

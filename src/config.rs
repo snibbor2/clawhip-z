@@ -3,11 +3,13 @@ use std::env;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
 use crate::Result;
 use crate::events::MessageFormat;
+use crate::source::workspace::{default_workspace_debounce_ms, default_workspace_watch_dirs};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AppConfig {
@@ -16,6 +18,8 @@ pub struct AppConfig {
     #[serde(default, skip_serializing_if = "ProvidersConfig::is_empty")]
     pub providers: ProvidersConfig,
     #[serde(default)]
+    pub dispatch: DispatchConfig,
+    #[serde(default)]
     pub daemon: DaemonConfig,
     #[serde(default)]
     pub defaults: DefaultsConfig,
@@ -23,6 +27,8 @@ pub struct AppConfig {
     pub routes: Vec<RouteRule>,
     #[serde(default)]
     pub monitors: MonitorConfig,
+    #[serde(default, skip_serializing_if = "CronConfig::is_empty")]
+    pub cron: CronConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -73,6 +79,26 @@ impl Default for DaemonConfig {
             port: default_port(),
             base_url: default_base_url(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DispatchConfig {
+    #[serde(default = "default_ci_batch_window_secs")]
+    pub ci_batch_window_secs: u64,
+}
+
+impl Default for DispatchConfig {
+    fn default() -> Self {
+        Self {
+            ci_batch_window_secs: default_ci_batch_window_secs(),
+        }
+    }
+}
+
+impl DispatchConfig {
+    pub fn ci_batch_window(&self) -> Duration {
+        Duration::from_secs(self.ci_batch_window_secs.max(1))
     }
 }
 
@@ -172,6 +198,8 @@ pub struct MonitorConfig {
     pub git: GitMonitorConfig,
     #[serde(default)]
     pub tmux: TmuxMonitorConfig,
+    #[serde(default)]
+    pub workspace: Vec<WorkspaceMonitor>,
 }
 
 impl Default for MonitorConfig {
@@ -182,6 +210,7 @@ impl Default for MonitorConfig {
             github_api_base: default_github_api_base(),
             git: GitMonitorConfig::default(),
             tmux: TmuxMonitorConfig::default(),
+            workspace: Vec::new(),
         }
     }
 }
@@ -264,6 +293,83 @@ impl Default for TmuxSessionMonitor {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceMonitor {
+    pub path: String,
+    #[serde(default = "default_workspace_watch_dirs")]
+    pub watch_dirs: Vec<String>,
+    #[serde(default)]
+    pub discover_worktrees: bool,
+    pub channel: Option<String>,
+    pub mention: Option<String>,
+    pub format: Option<MessageFormat>,
+    #[serde(default)]
+    pub events: Vec<String>,
+    pub poll_interval_secs: Option<u64>,
+    #[serde(default = "default_workspace_debounce_ms")]
+    pub debounce_ms: u64,
+}
+
+impl Default for WorkspaceMonitor {
+    fn default() -> Self {
+        Self {
+            path: String::new(),
+            watch_dirs: default_workspace_watch_dirs(),
+            discover_worktrees: false,
+            channel: None,
+            mention: None,
+            format: None,
+            events: Vec::new(),
+            poll_interval_secs: None,
+            debounce_ms: default_workspace_debounce_ms(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CronConfig {
+    #[serde(default = "default_cron_poll_interval_secs")]
+    pub poll_interval_secs: u64,
+    #[serde(default)]
+    pub jobs: Vec<CronJob>,
+}
+
+impl Default for CronConfig {
+    fn default() -> Self {
+        Self {
+            poll_interval_secs: default_cron_poll_interval_secs(),
+            jobs: Vec::new(),
+        }
+    }
+}
+
+impl CronConfig {
+    fn is_empty(&self) -> bool {
+        self.jobs.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CronJob {
+    pub id: String,
+    pub schedule: String,
+    #[serde(default = "default_cron_timezone")]
+    pub timezone: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    pub channel: Option<String>,
+    pub mention: Option<String>,
+    pub format: Option<MessageFormat>,
+    #[serde(flatten)]
+    pub kind: CronJobKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum CronJobKind {
+    CustomMessage { message: String },
+}
+
 pub fn default_config_path() -> PathBuf {
     if let Ok(override_path) = env::var("CLAWHIP_CONFIG") {
         return PathBuf::from(override_path);
@@ -293,8 +399,17 @@ fn default_remote() -> String {
 fn default_stale_minutes() -> u64 {
     10
 }
+fn default_ci_batch_window_secs() -> u64 {
+    30
+}
 fn default_keyword_window_secs() -> u64 {
     30
+}
+fn default_cron_poll_interval_secs() -> u64 {
+    30
+}
+fn default_cron_timezone() -> String {
+    "UTC".to_string()
 }
 fn default_true() -> bool {
     true
@@ -456,6 +571,13 @@ impl AppConfig {
     }
 
     pub fn validate(&self) -> Result<()> {
+        if self.dispatch.ci_batch_window_secs == 0 {
+            return Err("dispatch.ci_batch_window_secs must be at least 1".into());
+        }
+        if self.cron.poll_interval_secs == 0 {
+            return Err("cron.poll_interval_secs must be at least 1".into());
+        }
+
         for (index, route) in self.routes.iter().enumerate() {
             let sink = route.effective_sink();
             let has_channel = normalize_secret(route.channel.clone()).is_some();
@@ -516,6 +638,38 @@ impl AppConfig {
                     }
                 }
                 _ => unreachable!(),
+            }
+        }
+
+        for (index, workspace) in self.monitors.workspace.iter().enumerate() {
+            if workspace.path.trim().is_empty() {
+                return Err(format!("workspace monitor #{} must set path", index + 1).into());
+            }
+            if workspace.watch_dirs.is_empty() {
+                return Err(format!(
+                    "workspace monitor #{} must set at least one watch_dirs entry",
+                    index + 1
+                )
+                .into());
+            }
+            if workspace.channel.is_none()
+                && self.defaults.channel.is_none()
+                && !self.has_webhook_routes()
+            {
+                return Err(format!(
+                    "workspace monitor #{} has no channel and no default Discord destination",
+                    index + 1
+                )
+                .into());
+            }
+        }
+
+        let mut cron_ids = std::collections::BTreeSet::new();
+        for (index, job) in self.cron.jobs.iter().enumerate() {
+            crate::cron::validate_job(job)
+                .map_err(|error| format!("cron job #{}: {error}", index + 1))?;
+            if !cron_ids.insert(job.id.as_str()) {
+                return Err(format!("duplicate cron job id '{}'", job.id).into());
             }
         }
 
@@ -622,6 +776,7 @@ impl AppConfig {
             "  Bind host/port: {}:{}",
             self.daemon.bind_host, self.daemon.port
         );
+        println!("  CI batch window: {}s", self.dispatch.ci_batch_window_secs);
         println!(
             "  Default channel: {}",
             self.defaults.channel.as_deref().unwrap_or("<unset>")
@@ -631,12 +786,14 @@ impl AppConfig {
         println!("  Routes: {}", self.routes.len());
         println!("  Git monitors: {}", self.monitors.git.repos.len());
         println!("  Tmux monitors: {}", self.monitors.tmux.sessions.len());
+        println!("  Workspace monitors: {}", self.monitors.workspace.len());
+        println!("  Cron jobs: {}", self.cron.jobs.len());
     }
 
     fn print_template_hint(&self) {
         println!("Edit the config file directly for routes and monitor definitions.");
         println!(
-            "Sections: [providers.discord], [daemon], [[routes]], [[monitors.git.repos]], [[monitors.tmux.sessions]]"
+            "Sections: [providers.discord], [dispatch], [daemon], [cron], [[cron.jobs]], [[routes]], [[monitors.git.repos]], [[monitors.tmux.sessions]], [[monitors.workspace]]"
         );
         println!(
             "Routes may set either channel = \"...\" or webhook = \"https://discord.com/api/webhooks/...\"."
@@ -676,6 +833,41 @@ impl AppConfig {
         for session in &mut self.monitors.tmux.sessions {
             session.channel = normalize_text(session.channel.clone());
             session.mention = normalize_text(session.mention.clone());
+        }
+
+        for workspace in &mut self.monitors.workspace {
+            workspace.path = normalize_text(Some(workspace.path.clone())).unwrap_or_default();
+            workspace.channel = normalize_text(workspace.channel.clone());
+            workspace.mention = normalize_text(workspace.mention.clone());
+            workspace.watch_dirs = workspace
+                .watch_dirs
+                .iter()
+                .filter_map(|dir| normalize_text(Some(dir.clone())))
+                .collect();
+            if workspace.watch_dirs.is_empty() {
+                workspace.watch_dirs = default_workspace_watch_dirs();
+            }
+            workspace.events = workspace
+                .events
+                .iter()
+                .filter_map(|event| normalize_text(Some(event.clone())))
+                .collect();
+            workspace.debounce_ms = workspace.debounce_ms.max(1);
+            workspace.poll_interval_secs = workspace.poll_interval_secs.map(|secs| secs.max(1));
+        }
+
+        for job in &mut self.cron.jobs {
+            job.id = normalize_text(Some(job.id.clone())).unwrap_or_default();
+            job.schedule = normalize_text(Some(job.schedule.clone())).unwrap_or_default();
+            job.timezone =
+                normalize_text(Some(job.timezone.clone())).unwrap_or_else(default_cron_timezone);
+            job.channel = normalize_text(job.channel.clone());
+            job.mention = normalize_text(job.mention.clone());
+            match &mut job.kind {
+                CronJobKind::CustomMessage { message } => {
+                    *message = normalize_text(Some(message.clone())).unwrap_or_default();
+                }
+            }
         }
     }
 
@@ -938,5 +1130,239 @@ mod tests {
     fn tmux_session_monitor_defaults_keyword_window_to_thirty_seconds() {
         let session = TmuxSessionMonitor::default();
         assert_eq!(session.keyword_window_secs, 30);
+    }
+
+    #[test]
+    fn dispatch_config_defaults_ci_batch_window_to_thirty_seconds() {
+        let config = AppConfig::default();
+        assert_eq!(config.dispatch.ci_batch_window_secs, 30);
+    }
+
+    #[test]
+    fn cron_config_defaults_are_backward_compatible() {
+        let config = AppConfig::default();
+        assert_eq!(config.cron.poll_interval_secs, 30);
+        assert!(config.cron.jobs.is_empty());
+    }
+
+    #[test]
+    fn load_or_default_parses_dispatch_ci_batch_window_secs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "[providers.discord]\ntoken = \"abc\"\n[dispatch]\nci_batch_window_secs = 90\n",
+        )
+        .unwrap();
+
+        let config = AppConfig::load_or_default(&path).unwrap();
+
+        assert_eq!(config.dispatch.ci_batch_window_secs, 90);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn load_or_default_defaults_dispatch_ci_batch_window_when_omitted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "[providers.discord]\ntoken = \"abc\"\n").unwrap();
+
+        let config = AppConfig::load_or_default(&path).unwrap();
+
+        assert_eq!(config.dispatch.ci_batch_window_secs, 30);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn load_or_default_preserves_zero_dispatch_ci_batch_window_secs_until_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "[providers.discord]\ntoken = \"abc\"\n[dispatch]\nci_batch_window_secs = 0\n",
+        )
+        .unwrap();
+
+        let config = AppConfig::load_or_default(&path).unwrap();
+        assert_eq!(config.dispatch.ci_batch_window_secs, 0);
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("dispatch.ci_batch_window_secs must be at least 1"));
+    }
+
+    #[test]
+    fn load_or_default_parses_cron_jobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"[providers.discord]
+token = "abc"
+
+[cron]
+poll_interval_secs = 15
+
+[[cron.jobs]]
+id = "dev-followup"
+schedule = "*/30 * * * *"
+channel = "ops"
+mention = " <@1> "
+kind = "custom-message"
+message = " ping "
+"#,
+        )
+        .unwrap();
+
+        let config = AppConfig::load_or_default(&path).unwrap();
+
+        assert_eq!(config.cron.poll_interval_secs, 15);
+        assert_eq!(config.cron.jobs.len(), 1);
+        let job = &config.cron.jobs[0];
+        assert_eq!(job.id, "dev-followup");
+        assert_eq!(job.schedule, "*/30 * * * *");
+        assert_eq!(job.channel.as_deref(), Some("ops"));
+        assert_eq!(job.mention.as_deref(), Some("<@1>"));
+        assert_eq!(job.timezone, "UTC");
+        match &job.kind {
+            CronJobKind::CustomMessage { message } => assert_eq!(message, "ping"),
+        }
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn cron_validation_rejects_duplicate_ids() {
+        let config = AppConfig {
+            providers: ProvidersConfig {
+                discord: DiscordConfig {
+                    bot_token: Some("token".into()),
+                    legacy_default_channel: None,
+                },
+                slack: SlackConfig::default(),
+            },
+            cron: CronConfig {
+                poll_interval_secs: 30,
+                jobs: vec![
+                    CronJob {
+                        id: "dup".into(),
+                        schedule: "*/5 * * * *".into(),
+                        timezone: "UTC".into(),
+                        enabled: true,
+                        channel: Some("ops".into()),
+                        mention: None,
+                        format: None,
+                        kind: CronJobKind::CustomMessage {
+                            message: "first".into(),
+                        },
+                    },
+                    CronJob {
+                        id: "dup".into(),
+                        schedule: "0 * * * *".into(),
+                        timezone: "UTC".into(),
+                        enabled: true,
+                        channel: Some("ops".into()),
+                        mention: None,
+                        format: None,
+                        kind: CronJobKind::CustomMessage {
+                            message: "second".into(),
+                        },
+                    },
+                ],
+            },
+            ..AppConfig::default()
+        };
+
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("duplicate cron job id 'dup'"));
+    }
+
+    #[test]
+    fn workspace_monitor_defaults_are_backward_compatible() {
+        let config: AppConfig = toml::from_str(
+            "
+[providers.discord]
+token = 'discord-token'
+
+[[monitors.workspace]]
+path = '/tmp/repo'
+",
+        )
+        .unwrap();
+
+        assert_eq!(config.monitors.workspace.len(), 1);
+        let monitor = &config.monitors.workspace[0];
+        assert_eq!(monitor.watch_dirs, default_workspace_watch_dirs());
+        assert_eq!(monitor.debounce_ms, default_workspace_debounce_ms());
+        assert_eq!(monitor.poll_interval_secs, None);
+        assert!(!monitor.discover_worktrees);
+    }
+
+    #[test]
+    fn normalize_trims_workspace_monitor_fields() {
+        let mut config = AppConfig::default();
+        config.monitors.workspace.push(WorkspaceMonitor {
+            path: " /tmp/repo ".into(),
+            watch_dirs: vec![" .omx/state ".into(), "".into(), " .omc/state ".into()],
+            discover_worktrees: true,
+            channel: Some(" 123 ".into()),
+            mention: Some(" <@1> ".into()),
+            format: Some(MessageFormat::Compact),
+            events: vec!["workspace.*".into()],
+            poll_interval_secs: Some(5),
+            debounce_ms: 2000,
+        });
+
+        config.normalize();
+        let monitor = &config.monitors.workspace[0];
+        assert_eq!(monitor.path, "/tmp/repo");
+        assert_eq!(monitor.watch_dirs, vec![".omx/state", ".omc/state"]);
+        assert_eq!(monitor.channel.as_deref(), Some("123"));
+        assert_eq!(monitor.mention.as_deref(), Some("<@1>"));
+    }
+
+    #[test]
+    fn workspace_monitor_config_parses_and_normalizes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            format!(
+                r#"[providers.discord]
+token = "abc"
+
+[[monitors.workspace]]
+path = " {} "
+watch_dirs = [" .omx/state ", " .omc/state "]
+channel = " ops "
+mention = " <@1> "
+discover_worktrees = true
+events = [" workspace.skill.* "]
+debounce_ms = 1500
+poll_interval_secs = 9
+"#,
+                dir.path().display()
+            ),
+        )
+        .unwrap();
+
+        let config = AppConfig::load_or_default(&path).unwrap();
+        let monitor = &config.monitors.workspace[0];
+        assert_eq!(monitor.path, dir.path().display().to_string());
+        assert_eq!(monitor.watch_dirs, vec![".omx/state", ".omc/state"]);
+        assert_eq!(monitor.channel.as_deref(), Some("ops"));
+        assert_eq!(monitor.mention.as_deref(), Some("<@1>"));
+        assert!(monitor.discover_worktrees);
+        assert_eq!(monitor.events, vec!["workspace.skill.*"]);
+        assert_eq!(monitor.debounce_ms, 1500);
+        assert_eq!(monitor.poll_interval_secs, Some(9));
+    }
+
+    #[test]
+    fn config_without_workspace_monitor_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[providers.discord]\ntoken = \"abc\"\n").unwrap();
+
+        let config = AppConfig::load_or_default(&path).unwrap();
+        assert!(config.monitors.workspace.is_empty());
+        assert!(config.validate().is_ok());
     }
 }

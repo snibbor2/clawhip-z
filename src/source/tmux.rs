@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::process::Command;
 use tokio::sync::{RwLock, mpsc};
 use tokio::time::sleep;
@@ -13,9 +14,35 @@ use crate::client::DaemonClient;
 use crate::config::{AppConfig, TmuxSessionMonitor};
 use crate::events::{IncomingEvent, MessageFormat};
 use crate::keyword_window::{PendingKeywordHits, collect_keyword_hits};
+use crate::router::glob_match;
 use crate::source::Source;
 
 pub type SharedTmuxRegistry = Arc<RwLock<HashMap<String, RegisteredTmuxSession>>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum RegistrationSource {
+    CliWatch,
+    CliNew,
+    #[default]
+    ConfigMonitor,
+}
+
+impl RegistrationSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CliWatch => "cli-watch",
+            Self::CliNew => "cli-new",
+            Self::ConfigMonitor => "config-monitor",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParentProcessInfo {
+    pub pid: u32,
+    pub name: Option<String>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisteredTmuxSession {
@@ -28,6 +55,12 @@ pub struct RegisteredTmuxSession {
     pub keyword_window_secs: u64,
     pub stale_minutes: u64,
     pub format: Option<MessageFormat>,
+    #[serde(default = "current_timestamp_rfc3339")]
+    pub registered_at: String,
+    #[serde(default)]
+    pub registration_source: RegistrationSource,
+    #[serde(default)]
+    pub parent_process: Option<ParentProcessInfo>,
     #[serde(default)]
     pub active_wrapper_monitor: bool,
 }
@@ -42,6 +75,9 @@ impl From<&TmuxSessionMonitor> for RegisteredTmuxSession {
             keyword_window_secs: value.keyword_window_secs,
             stale_minutes: value.stale_minutes,
             format: value.format.clone(),
+            registered_at: current_timestamp_rfc3339(),
+            registration_source: RegistrationSource::ConfigMonitor,
+            parent_process: None,
             active_wrapper_monitor: false,
         }
     }
@@ -215,24 +251,49 @@ pub async fn monitor_registered_session(
     Ok(())
 }
 
+pub async fn list_active_tmux_registrations(
+    config: &AppConfig,
+    registry: &SharedTmuxRegistry,
+) -> Result<Vec<RegisteredTmuxSession>> {
+    match list_tmux_sessions().await {
+        Ok(available_sessions) => {
+            sync_active_config_registrations(config, registry, &available_sessions).await;
+        }
+        Err(error) => {
+            eprintln!("clawhip source tmux list-sessions failed: {error}");
+        }
+    }
+
+    let snapshot = registry.read().await;
+    Ok(sorted_registry_snapshot(&snapshot))
+}
+
 async fn poll_tmux(
     config: &AppConfig,
     registry: &SharedTmuxRegistry,
     tx: &mpsc::Sender<IncomingEvent>,
     state: &mut TmuxMonitorState,
 ) -> Result<()> {
-    let mut sessions: BTreeMap<String, RegisteredTmuxSession> = config
-        .monitors
-        .tmux
-        .sessions
-        .iter()
-        .map(|session| {
-            (
-                session.session.clone(),
-                RegisteredTmuxSession::from(session),
-            )
-        })
-        .collect();
+    let available_sessions = match list_tmux_sessions().await {
+        Ok(sessions) => Some(sessions),
+        Err(error) => {
+            eprintln!("clawhip source tmux list-sessions failed: {error}");
+            None
+        }
+    };
+    if let Some(available_sessions) = available_sessions.as_ref() {
+        sync_active_config_registrations(config, registry, available_sessions).await;
+    }
+    let mut sessions = resolve_monitored_sessions(
+        config
+            .monitors
+            .tmux
+            .sessions
+            .iter()
+            .map(RegisteredTmuxSession::from)
+            .collect(),
+        available_sessions.as_ref(),
+    );
     for (session, registration) in registry.read().await.iter() {
         sessions.insert(session.clone(), registration.clone());
     }
@@ -366,6 +427,163 @@ async fn poll_tmux(
         .retain(|session, _| sessions.contains_key(session));
 
     Ok(())
+}
+
+async fn sync_active_config_registrations(
+    config: &AppConfig,
+    registry: &SharedTmuxRegistry,
+    available_sessions: &HashSet<String>,
+) {
+    let existing_registry = registry.read().await.clone();
+    let resolved = resolve_monitored_sessions(
+        config
+            .monitors
+            .tmux
+            .sessions
+            .iter()
+            .map(RegisteredTmuxSession::from)
+            .collect(),
+        Some(available_sessions),
+    );
+    let active_config = resolved
+        .into_iter()
+        .filter(|(session, _)| available_sessions.contains(session))
+        .map(|(session, mut registration)| {
+            if let Some(existing) = existing_registry.get(&session).filter(|existing| {
+                !existing.active_wrapper_monitor
+                    && existing.registration_source == RegistrationSource::ConfigMonitor
+            }) {
+                registration.registered_at = existing.registered_at.clone();
+                registration.parent_process = existing.parent_process.clone();
+            }
+            (session, registration)
+        })
+        .collect();
+
+    let mut write = registry.write().await;
+    merge_active_config_registrations(&mut write, active_config);
+}
+
+fn merge_active_config_registrations(
+    registry: &mut HashMap<String, RegisteredTmuxSession>,
+    active_config: BTreeMap<String, RegisteredTmuxSession>,
+) {
+    let active_sessions: HashSet<String> = active_config.keys().cloned().collect();
+    registry.retain(|session, registration| {
+        registration.active_wrapper_monitor
+            || registration.registration_source != RegistrationSource::ConfigMonitor
+            || active_sessions.contains(session)
+    });
+
+    for (session, mut registration) in active_config {
+        if let Some(existing) = registry.get(&session) {
+            if existing.active_wrapper_monitor {
+                continue;
+            }
+            if existing.registration_source == RegistrationSource::ConfigMonitor {
+                registration.registered_at = existing.registered_at.clone();
+                registration.parent_process = existing.parent_process.clone();
+            }
+        }
+        registry.insert(session, registration);
+    }
+}
+
+fn sorted_registry_snapshot(
+    registry: &HashMap<String, RegisteredTmuxSession>,
+) -> Vec<RegisteredTmuxSession> {
+    let mut sessions: BTreeMap<String, RegisteredTmuxSession> = BTreeMap::new();
+    for (session, registration) in registry {
+        sessions.insert(session.clone(), registration.clone());
+    }
+    sessions.into_values().collect()
+}
+
+fn resolve_monitored_sessions(
+    configured_sessions: Vec<RegisteredTmuxSession>,
+    available_sessions: Option<&HashSet<String>>,
+) -> BTreeMap<String, RegisteredTmuxSession> {
+    let mut resolved: BTreeMap<String, (MonitorSpecificity, RegisteredTmuxSession)> =
+        BTreeMap::new();
+
+    for registration in configured_sessions {
+        let specificity = MonitorSpecificity::for_pattern(&registration.session);
+        let matched_sessions = available_sessions
+            .into_iter()
+            .flat_map(|sessions| sessions.iter())
+            .filter(|session| glob_match(&registration.session, session))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        if matched_sessions.is_empty() {
+            if !is_session_pattern(&registration.session) {
+                insert_resolved_session(
+                    &mut resolved,
+                    registration.session.clone(),
+                    specificity,
+                    registration,
+                );
+            }
+            continue;
+        }
+
+        for session in matched_sessions {
+            let mut registration = registration.clone();
+            registration.session = session.clone();
+            insert_resolved_session(&mut resolved, session, specificity, registration);
+        }
+    }
+
+    resolved
+        .into_iter()
+        .map(|(session, (_, registration))| (session, registration))
+        .collect()
+}
+
+fn is_session_pattern(session: &str) -> bool {
+    session.contains('*')
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MonitorSpecificity {
+    exact_match: bool,
+    literal_chars: usize,
+    wildcard_count: usize,
+}
+
+impl MonitorSpecificity {
+    fn for_pattern(pattern: &str) -> Self {
+        Self {
+            exact_match: !is_session_pattern(pattern),
+            literal_chars: pattern.chars().filter(|ch| *ch != '*').count(),
+            wildcard_count: pattern.chars().filter(|ch| *ch == '*').count(),
+        }
+    }
+
+    fn outranks(self, other: Self) -> bool {
+        if self.exact_match != other.exact_match {
+            return self.exact_match;
+        }
+        if self.literal_chars != other.literal_chars {
+            return self.literal_chars > other.literal_chars;
+        }
+
+        self.wildcard_count < other.wildcard_count
+    }
+}
+
+fn insert_resolved_session(
+    resolved: &mut BTreeMap<String, (MonitorSpecificity, RegisteredTmuxSession)>,
+    session: String,
+    specificity: MonitorSpecificity,
+    registration: RegisteredTmuxSession,
+) {
+    match resolved.get(&session) {
+        Some((existing_specificity, _)) if !specificity.outranks(*existing_specificity) => {}
+        _ => {
+            resolved.insert(session, (specificity, registration));
+        }
+    }
 }
 
 fn should_emit_stale(pane: &TmuxPaneState, now: Instant, stale_minutes: u64) -> bool {
@@ -519,6 +737,25 @@ pub(crate) async fn session_exists(session: &str) -> Result<bool> {
     Ok(output.status.success())
 }
 
+async fn list_tmux_sessions() -> Result<HashSet<String>> {
+    let output = Command::new(tmux_bin())
+        .arg("list-sessions")
+        .arg("-F")
+        .arg("#{session_name}")
+        .output()
+        .await?;
+    if !output.status.success() {
+        return Err(tmux_stderr(&output.stderr).into());
+    }
+
+    Ok(String::from_utf8(output.stdout)?
+        .lines()
+        .map(str::trim)
+        .filter(|session| !session.is_empty())
+        .map(ToString::to_string)
+        .collect())
+}
+
 async fn snapshot_tmux_session(session: &str) -> Result<Vec<TmuxPaneSnapshot>> {
     let output = Command::new(tmux_bin())
         .arg("list-panes")
@@ -591,6 +828,12 @@ fn default_keyword_window_secs() -> u64 {
     30
 }
 
+pub fn current_timestamp_rfc3339() -> String {
+    OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -606,6 +849,9 @@ mod tests {
             keyword_window_secs: 30,
             stale_minutes: 15,
             format: Some(MessageFormat::Compact),
+            registered_at: "2026-04-02T00:00:00Z".into(),
+            registration_source: RegistrationSource::ConfigMonitor,
+            parent_process: None,
             active_wrapper_monitor: false,
         }
     }
@@ -689,6 +935,133 @@ PR created #7",
         assert_eq!(event.payload["pane"], "0.0");
         assert_eq!(event.payload["minutes"], 15);
         assert_eq!(event.payload["last_line"], "waiting");
+    }
+
+    #[test]
+    fn config_monitor_registration_sets_audit_defaults() {
+        let monitor = TmuxSessionMonitor {
+            session: "issue-*".into(),
+            channel: Some("alerts".into()),
+            mention: None,
+            keywords: vec!["panic".into()],
+            keyword_window_secs: 30,
+            stale_minutes: 10,
+            format: None,
+        };
+
+        let registration = RegisteredTmuxSession::from(&monitor);
+
+        assert!(matches!(
+            registration.registration_source,
+            RegistrationSource::ConfigMonitor
+        ));
+        assert!(!registration.registered_at.is_empty());
+        assert!(registration.parent_process.is_none());
+    }
+
+    #[test]
+    fn merge_active_config_registrations_preserves_existing_timestamps_and_prunes_inactive_ones() {
+        let mut registry = HashMap::from([
+            (
+                "issue-105".into(),
+                RegisteredTmuxSession {
+                    session: "issue-105".into(),
+                    channel: Some("alerts".into()),
+                    mention: None,
+                    keywords: vec!["error".into()],
+                    keyword_window_secs: 30,
+                    stale_minutes: 10,
+                    format: None,
+                    registered_at: "2026-04-02T00:00:00Z".into(),
+                    registration_source: RegistrationSource::ConfigMonitor,
+                    parent_process: None,
+                    active_wrapper_monitor: false,
+                },
+            ),
+            (
+                "wrapper".into(),
+                RegisteredTmuxSession {
+                    session: "wrapper".into(),
+                    channel: Some("alerts".into()),
+                    mention: None,
+                    keywords: vec!["panic".into()],
+                    keyword_window_secs: 30,
+                    stale_minutes: 10,
+                    format: None,
+                    registered_at: "2026-04-02T01:00:00Z".into(),
+                    registration_source: RegistrationSource::CliWatch,
+                    parent_process: Some(ParentProcessInfo {
+                        pid: 42,
+                        name: Some("codex".into()),
+                    }),
+                    active_wrapper_monitor: true,
+                },
+            ),
+            (
+                "stale-config".into(),
+                RegisteredTmuxSession {
+                    session: "stale-config".into(),
+                    channel: Some("alerts".into()),
+                    mention: None,
+                    keywords: vec!["panic".into()],
+                    keyword_window_secs: 30,
+                    stale_minutes: 10,
+                    format: None,
+                    registered_at: "2026-04-02T02:00:00Z".into(),
+                    registration_source: RegistrationSource::ConfigMonitor,
+                    parent_process: None,
+                    active_wrapper_monitor: false,
+                },
+            ),
+        ]);
+
+        merge_active_config_registrations(
+            &mut registry,
+            BTreeMap::from([(
+                "issue-105".into(),
+                RegisteredTmuxSession {
+                    session: "issue-105".into(),
+                    channel: Some("alerts".into()),
+                    mention: None,
+                    keywords: vec!["error".into(), "complete".into()],
+                    keyword_window_secs: 30,
+                    stale_minutes: 10,
+                    format: None,
+                    registered_at: "2026-04-02T09:00:00Z".into(),
+                    registration_source: RegistrationSource::ConfigMonitor,
+                    parent_process: None,
+                    active_wrapper_monitor: false,
+                },
+            )]),
+        );
+
+        assert_eq!(registry.len(), 2);
+        assert_eq!(registry["issue-105"].registered_at, "2026-04-02T00:00:00Z");
+        assert_eq!(registry["issue-105"].keywords, vec!["error", "complete"]);
+        assert!(registry.contains_key("wrapper"));
+        assert!(!registry.contains_key("stale-config"));
+    }
+
+    #[test]
+    fn registered_tmux_session_deserializes_without_new_audit_fields() {
+        let registration: RegisteredTmuxSession = serde_json::from_value(serde_json::json!({
+            "session": "issue-24",
+            "channel": "alerts",
+            "mention": "<@123>",
+            "keywords": ["panic"],
+            "keyword_window_secs": 30,
+            "stale_minutes": 10,
+            "format": "compact",
+            "active_wrapper_monitor": false
+        }))
+        .unwrap();
+
+        assert!(matches!(
+            registration.registration_source,
+            RegistrationSource::ConfigMonitor
+        ));
+        assert!(registration.parent_process.is_none());
+        assert!(!registration.registered_at.is_empty());
     }
 
     #[tokio::test]
@@ -940,5 +1313,241 @@ error: failed";
         let event = rx.recv().await.unwrap();
         assert_eq!(event.payload["keyword"], "error");
         assert_eq!(event.payload["line"], "error: failed");
+    }
+
+    #[test]
+    fn resolve_monitored_sessions_expands_glob_patterns_to_actual_sessions() {
+        let available_sessions = HashSet::from([
+            "rcc-api".to_string(),
+            "rcc-web".to_string(),
+            "other".to_string(),
+        ]);
+        let resolved = resolve_monitored_sessions(
+            vec![RegisteredTmuxSession {
+                session: "rcc-*".into(),
+                channel: Some("alerts".into()),
+                mention: None,
+                keywords: vec!["panic".into()],
+                keyword_window_secs: 30,
+                stale_minutes: 10,
+                format: None,
+                registered_at: "2026-04-02T00:00:00Z".into(),
+                registration_source: RegistrationSource::ConfigMonitor,
+                parent_process: None,
+                active_wrapper_monitor: false,
+            }],
+            Some(&available_sessions),
+        );
+
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved["rcc-api"].session, "rcc-api");
+        assert_eq!(resolved["rcc-api"].channel.as_deref(), Some("alerts"));
+        assert_eq!(resolved["rcc-api"].keywords, vec!["panic"]);
+        assert_eq!(resolved["rcc-web"].session, "rcc-web");
+        assert_eq!(resolved["rcc-web"].channel.as_deref(), Some("alerts"));
+    }
+
+    #[test]
+    fn resolve_monitored_sessions_keeps_keywords_isolated_per_actual_session() {
+        let available_sessions = HashSet::from(["rcc-prod".to_string(), "omx-prod".to_string()]);
+        let resolved = resolve_monitored_sessions(
+            vec![
+                RegisteredTmuxSession {
+                    session: "rcc-*".into(),
+                    channel: Some("rcc-alerts".into()),
+                    mention: None,
+                    keywords: vec!["panic".into()],
+                    keyword_window_secs: 30,
+                    stale_minutes: 10,
+                    format: None,
+                    registered_at: "2026-04-02T00:00:00Z".into(),
+                    registration_source: RegistrationSource::ConfigMonitor,
+                    parent_process: None,
+                    active_wrapper_monitor: false,
+                },
+                RegisteredTmuxSession {
+                    session: "omx-*".into(),
+                    channel: Some("omx-alerts".into()),
+                    mention: None,
+                    keywords: vec!["error".into()],
+                    keyword_window_secs: 30,
+                    stale_minutes: 10,
+                    format: None,
+                    registered_at: "2026-04-02T00:00:00Z".into(),
+                    registration_source: RegistrationSource::ConfigMonitor,
+                    parent_process: None,
+                    active_wrapper_monitor: false,
+                },
+            ],
+            Some(&available_sessions),
+        );
+
+        assert_eq!(resolved["rcc-prod"].keywords, vec!["panic"]);
+        assert_eq!(resolved["rcc-prod"].channel.as_deref(), Some("rcc-alerts"));
+        assert_eq!(resolved["omx-prod"].keywords, vec!["error"]);
+        assert_eq!(resolved["omx-prod"].channel.as_deref(), Some("omx-alerts"));
+    }
+
+    #[test]
+    fn resolve_monitored_sessions_keeps_exact_sessions_when_listing_is_unavailable() {
+        let resolved = resolve_monitored_sessions(
+            vec![
+                RegisteredTmuxSession {
+                    session: "exact-session".into(),
+                    channel: Some("alerts".into()),
+                    mention: None,
+                    keywords: vec!["panic".into()],
+                    keyword_window_secs: 30,
+                    stale_minutes: 10,
+                    format: None,
+                    registered_at: "2026-04-02T00:00:00Z".into(),
+                    registration_source: RegistrationSource::ConfigMonitor,
+                    parent_process: None,
+                    active_wrapper_monitor: false,
+                },
+                RegisteredTmuxSession {
+                    session: "rcc-*".into(),
+                    channel: Some("alerts".into()),
+                    mention: None,
+                    keywords: vec!["panic".into()],
+                    keyword_window_secs: 30,
+                    stale_minutes: 10,
+                    format: None,
+                    registered_at: "2026-04-02T00:00:00Z".into(),
+                    registration_source: RegistrationSource::ConfigMonitor,
+                    parent_process: None,
+                    active_wrapper_monitor: false,
+                },
+            ],
+            None,
+        );
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved["exact-session"].session, "exact-session");
+    }
+
+    #[test]
+    fn resolve_monitored_sessions_prefers_exact_match_over_glob_overlap() {
+        let available_sessions = HashSet::from(["rcc-api".to_string()]);
+        let resolved = resolve_monitored_sessions(
+            vec![
+                RegisteredTmuxSession {
+                    session: "*".into(),
+                    channel: Some("default-alerts".into()),
+                    mention: None,
+                    keywords: vec!["error".into()],
+                    keyword_window_secs: 30,
+                    stale_minutes: 10,
+                    format: None,
+                    registered_at: "2026-04-02T00:00:00Z".into(),
+                    registration_source: RegistrationSource::ConfigMonitor,
+                    parent_process: None,
+                    active_wrapper_monitor: false,
+                },
+                RegisteredTmuxSession {
+                    session: "rcc-api".into(),
+                    channel: Some("rcc-alerts".into()),
+                    mention: None,
+                    keywords: vec!["panic".into()],
+                    keyword_window_secs: 30,
+                    stale_minutes: 10,
+                    format: None,
+                    registered_at: "2026-04-02T00:00:00Z".into(),
+                    registration_source: RegistrationSource::ConfigMonitor,
+                    parent_process: None,
+                    active_wrapper_monitor: false,
+                },
+            ],
+            Some(&available_sessions),
+        );
+
+        assert_eq!(resolved["rcc-api"].channel.as_deref(), Some("rcc-alerts"));
+        assert_eq!(resolved["rcc-api"].keywords, vec!["panic"]);
+    }
+
+    #[test]
+    fn resolve_monitored_sessions_prefers_more_specific_glob_over_broader_glob() {
+        let available_sessions = HashSet::from(["rcc-api".to_string(), "omx-api".to_string()]);
+        let resolved = resolve_monitored_sessions(
+            vec![
+                RegisteredTmuxSession {
+                    session: "*".into(),
+                    channel: Some("default-alerts".into()),
+                    mention: None,
+                    keywords: vec!["error".into()],
+                    keyword_window_secs: 30,
+                    stale_minutes: 10,
+                    format: None,
+                    registered_at: "2026-04-02T00:00:00Z".into(),
+                    registration_source: RegistrationSource::ConfigMonitor,
+                    parent_process: None,
+                    active_wrapper_monitor: false,
+                },
+                RegisteredTmuxSession {
+                    session: "rcc-*".into(),
+                    channel: Some("rcc-alerts".into()),
+                    mention: None,
+                    keywords: vec!["panic".into()],
+                    keyword_window_secs: 30,
+                    stale_minutes: 10,
+                    format: None,
+                    registered_at: "2026-04-02T00:00:00Z".into(),
+                    registration_source: RegistrationSource::ConfigMonitor,
+                    parent_process: None,
+                    active_wrapper_monitor: false,
+                },
+            ],
+            Some(&available_sessions),
+        );
+
+        assert_eq!(resolved["rcc-api"].channel.as_deref(), Some("rcc-alerts"));
+        assert_eq!(resolved["rcc-api"].keywords, vec!["panic"]);
+        assert_eq!(
+            resolved["omx-api"].channel.as_deref(),
+            Some("default-alerts")
+        );
+        assert_eq!(resolved["omx-api"].keywords, vec!["error"]);
+    }
+
+    #[test]
+    fn resolve_monitored_sessions_breaks_same_literal_ties_with_fewer_wildcards() {
+        let available_sessions = HashSet::from(["abc-prod".to_string()]);
+        let resolved = resolve_monitored_sessions(
+            vec![
+                RegisteredTmuxSession {
+                    session: "*abc*".into(),
+                    channel: Some("broad-alerts".into()),
+                    mention: None,
+                    keywords: vec!["error".into()],
+                    keyword_window_secs: 30,
+                    stale_minutes: 10,
+                    format: None,
+                    registered_at: "2026-04-02T00:00:00Z".into(),
+                    registration_source: RegistrationSource::ConfigMonitor,
+                    parent_process: None,
+                    active_wrapper_monitor: false,
+                },
+                RegisteredTmuxSession {
+                    session: "abc*".into(),
+                    channel: Some("specific-alerts".into()),
+                    mention: None,
+                    keywords: vec!["panic".into()],
+                    keyword_window_secs: 30,
+                    stale_minutes: 10,
+                    format: None,
+                    registered_at: "2026-04-02T00:00:00Z".into(),
+                    registration_source: RegistrationSource::ConfigMonitor,
+                    parent_process: None,
+                    active_wrapper_monitor: false,
+                },
+            ],
+            Some(&available_sessions),
+        );
+
+        assert_eq!(
+            resolved["abc-prod"].channel.as_deref(),
+            Some("specific-alerts")
+        );
+        assert_eq!(resolved["abc-prod"].keywords, vec!["panic"]);
     }
 }

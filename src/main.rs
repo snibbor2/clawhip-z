@@ -2,6 +2,7 @@ mod cli;
 mod client;
 mod config;
 mod core;
+mod cron;
 mod daemon;
 mod discord;
 mod dispatch;
@@ -24,8 +25,8 @@ use std::sync::Arc;
 use clap::Parser;
 
 use crate::cli::{
-    AgentCommands, Cli, Commands, ConfigCommand, GitCommands, GithubCommands, MemoryCommands,
-    PluginCommands, TmuxCommands,
+    AgentCommands, Cli, Commands, ConfigCommand, CronCommands, GitCommands, GithubCommands,
+    MemoryCommands, OmxCommands, PluginCommands, TmuxCommands,
 };
 use crate::client::DaemonClient;
 use crate::config::AppConfig;
@@ -55,9 +56,10 @@ async fn real_main() -> Result<()> {
     let cli = Cli::parse();
     let config_path = cli.config_path();
     let config = Arc::new(AppConfig::load_or_default(&config_path)?);
+    let cron_state_path = crate::cron::default_state_path(&config_path);
 
     match cli.command.unwrap_or(Commands::Start { port: None }) {
-        Commands::Start { port } => daemon::run(config, port).await,
+        Commands::Start { port } => daemon::run(config, port, cron_state_path).await,
         Commands::Status => {
             let client = DaemonClient::from_config(config.as_ref());
             let health = client.health().await?;
@@ -204,6 +206,28 @@ async fn real_main() -> Result<()> {
             }
             TmuxCommands::New(args) => tmux_wrapper::run(args, config.as_ref()).await,
             TmuxCommands::Watch(args) => tmux_wrapper::watch(args, config.as_ref()).await,
+            TmuxCommands::List => {
+                let client = DaemonClient::from_config(config.as_ref());
+                let registrations = client.list_tmux().await?;
+                render_tmux_list(&registrations);
+                Ok(())
+            }
+        },
+        Commands::Omx { command } => match command {
+            OmxCommands::Hook(args) => {
+                let client = DaemonClient::from_config(config.as_ref());
+                let payload = args.read_payload(&mut std::io::stdin())?;
+                let response = client.send_omx_hook(&payload).await?;
+                println!("{}", serde_json::to_string(&response)?);
+                Ok(())
+            }
+        },
+        Commands::Cron { command } => match command {
+            CronCommands::Run { id } => {
+                crate::cron::run_configured_job(config.as_ref(), &id).await?;
+                println!("Ran cron job {id}");
+                Ok(())
+            }
         },
         Commands::Config { command } => match command.unwrap_or(ConfigCommand::Interactive) {
             ConfigCommand::Interactive => {
@@ -251,4 +275,85 @@ async fn real_main() -> Result<()> {
 async fn send_incoming_event(client: &DaemonClient, event: IncomingEvent) -> Result<()> {
     let event = prepare_event(event)?;
     client.send_event(&event).await
+}
+
+fn render_tmux_list(registrations: &[crate::source::RegisteredTmuxSession]) {
+    print!("{}", format_tmux_list(registrations));
+}
+
+fn format_tmux_list(registrations: &[crate::source::RegisteredTmuxSession]) -> String {
+    if registrations.is_empty() {
+        return "No active tmux watches found\n".to_string();
+    }
+
+    let mut output =
+        "SESSION\tCHANNEL\tKEYWORDS\tMENTION\tSTALE_MINUTES\tSOURCE\tREGISTERED_AT\tPARENT\n"
+            .to_string();
+    for registration in registrations {
+        let keywords = if registration.keywords.is_empty() {
+            "-".to_string()
+        } else {
+            registration.keywords.join(",")
+        };
+        let parent = registration
+            .parent_process
+            .as_ref()
+            .map(|parent| match parent.name.as_deref() {
+                Some(name) => format!("{}:{name}", parent.pid),
+                None => parent.pid.to_string(),
+            })
+            .unwrap_or_else(|| "-".to_string());
+
+        output.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            registration.session,
+            registration.channel.as_deref().unwrap_or("-"),
+            keywords,
+            registration.mention.as_deref().unwrap_or("-"),
+            registration.stale_minutes,
+            registration.registration_source.as_str(),
+            registration.registered_at,
+            parent,
+        ));
+    }
+
+    output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_tmux_list;
+    use crate::source::tmux::{ParentProcessInfo, RegisteredTmuxSession, RegistrationSource};
+
+    #[test]
+    fn format_tmux_list_renders_metadata_columns() {
+        let output = format_tmux_list(&[RegisteredTmuxSession {
+            session: "issue-105".into(),
+            channel: Some("alerts".into()),
+            mention: Some("<@123>".into()),
+            keywords: vec!["error".into(), "complete".into()],
+            keyword_window_secs: 30,
+            stale_minutes: 10,
+            format: None,
+            registered_at: "2026-04-02T00:00:00Z".into(),
+            registration_source: RegistrationSource::CliWatch,
+            parent_process: Some(ParentProcessInfo {
+                pid: 4242,
+                name: Some("codex".into()),
+            }),
+            active_wrapper_monitor: true,
+        }]);
+
+        assert!(output.contains(
+            "SESSION\tCHANNEL\tKEYWORDS\tMENTION\tSTALE_MINUTES\tSOURCE\tREGISTERED_AT\tPARENT"
+        ));
+        assert!(output.contains(
+            "issue-105\talerts\terror,complete\t<@123>\t10\tcli-watch\t2026-04-02T00:00:00Z\t4242:codex"
+        ));
+    }
+
+    #[test]
+    fn format_tmux_list_handles_empty_registry() {
+        assert_eq!(format_tmux_list(&[]), "No active tmux watches found\n");
+    }
 }

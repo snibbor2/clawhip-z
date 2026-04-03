@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.5.1 - 2026-04-02
+
+### Highlights
+
+- made native OMX hook envelopes a first-class clawhip integration surface
+- added tmux watch audit trail and active watch listing
+- made the CI batch window configurable
+- fixed route-channel handling for tmux session startup events
+
+### Upgrade notes
+
+- crate version is now `0.5.1`
+- native OMX hook-bridge + SDK setup (`integrations/omx/`, `clawhip omx hook`, `/api/omx/hook`) is the default/recommended integration path
+- no config migration is required for this patch release
+
 ## 0.4.0 - 2026-03-11
 
 ### Highlights

@@ -4,7 +4,7 @@ pub mod compat;
 pub use body::{
     AgentEvent, CustomEvent, GitBranchChangedEvent, GitCommitAggregatedEvent, GitCommitEvent,
     GitHubCIEvent, GitHubIssueEvent, GitHubPREvent, GitHubPRStatusEvent,
-    TmuxKeywordAggregatedEvent, TmuxKeywordEvent, TmuxStaleEvent,
+    TmuxKeywordAggregatedEvent, TmuxKeywordEvent, TmuxStaleEvent, WorkspaceEvent,
 };
 
 use time::OffsetDateTime;
@@ -40,6 +40,17 @@ pub enum EventBody {
     AgentBlocked(AgentEvent),
     AgentFinished(AgentEvent),
     AgentFailed(AgentEvent),
+    AgentRetryNeeded(AgentEvent),
+    AgentPRCreated(AgentEvent),
+    AgentTestStarted(AgentEvent),
+    AgentTestFinished(AgentEvent),
+    AgentTestFailed(AgentEvent),
+    AgentHandoffNeeded(AgentEvent),
+    WorkspaceSessionStarted(WorkspaceEvent),
+    WorkspaceTurnComplete(WorkspaceEvent),
+    WorkspaceSkillActivated(WorkspaceEvent),
+    WorkspaceSessionBlocked(WorkspaceEvent),
+    WorkspaceMetricsUpdate(WorkspaceEvent),
     Custom(CustomEvent),
 }
 
