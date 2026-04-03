@@ -1,16 +1,17 @@
 # clawhip × OMX (oh-my-codex)
 
-Launch [OMX](https://github.com/Yeachan-Heo/oh-my-codex) coding sessions with native clawhip event routing and automatic Discord notifications.
+Launch [OMX](https://github.com/Yeachan-Heo/oh-my-codex) coding sessions with clawhip monitoring.
 
-## What you get
+## Source of truth
 
-- Native lifecycle emits via `clawhip omx hook`
-- clawhip-side normalization of richer native OMC/OMX events into the canonical `session.*` routing contract
-- Native OMX hook bridge assets in `integrations/omx/` for first-class OMX plugin forwarding
-- Session keyword alerts (error, PR created, complete, etc.)
-- Stale session detection (no output for N minutes)
-- All notifications routed to the correct Discord channel
-- Direct Slack/Discord notifications inside OMC/OMX should be treated as deprecated in clawhip-integrated setups
+clawhip owns the OMC/OMX integration doctrine.
+
+Use these docs for setup, routing policy, and troubleshooting:
+- quick operator flow: [`README.md`](../../README.md)
+- detailed OMX runbook: [`integrations/omx/README.md`](../../integrations/omx/README.md)
+- native routing/reference contract: [`docs/native-event-contract.md`](../../docs/native-event-contract.md)
+
+This skill should stay focused on OMX session-launch mechanics and local defaults.
 
 ## Prerequisites
 
@@ -37,9 +38,7 @@ Launch [OMX](https://github.com/Yeachan-Heo/oh-my-codex) coding sessions with na
 ./create.sh issue-123 ~/my-project/worktrees/issue-123 "Fix the bug in src/main.rs and create a PR to dev" 1234567890 "<@user-id>"
 ```
 
-`create.sh` now emits native clawhip v1 hook envelopes directly from the OMX shell session via `clawhip omx hook`, so you no longer need a separate lifecycle watcher command. If you pass a prompt, the script waits 10 seconds for the TUI to initialize, then sends the prompt via `tmux send-keys -l` before pressing Enter.
-
-For a first-class `.omx/hooks/*.mjs` bridge, see [`integrations/omx/`](../../integrations/omx/).
+`create.sh` emits native clawhip v1 hook envelopes directly from the OMX shell session via `clawhip omx hook`. If you pass a prompt, the script waits 10 seconds for the TUI to initialize, then sends the prompt via `tmux send-keys -l` before pressing Enter.
 
 ### Send a prompt
 
