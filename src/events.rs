@@ -601,9 +601,68 @@ impl IncomingEvent {
 
     pub fn template_context(&self) -> BTreeMap<String, String> {
         let mut context = BTreeMap::new();
-        context.insert("kind".to_string(), self.canonical_kind().to_string());
+        let canonical_kind = self.canonical_kind().to_string();
+        context.insert("kind".to_string(), canonical_kind.clone());
+        context.insert("event".to_string(), canonical_kind.clone());
+        if let Some(channel) = self
+            .channel
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            context.insert("channel".to_string(), channel.to_string());
+            context.insert("channel_hint".to_string(), channel.to_string());
+        }
+        if let Some(mention) = self
+            .mention
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            context.insert("mention".to_string(), mention.to_string());
+        }
+        if let Some(format) = self.format.as_ref() {
+            context.insert("format".to_string(), format.as_str().to_string());
+        }
+        if let Some(template) = self
+            .template
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            context.insert("template".to_string(), template.to_string());
+        }
         flatten_json("", &self.payload, &mut context);
+        insert_context_aliases(&mut context, &canonical_kind);
         context
+    }
+}
+
+fn insert_context_aliases(context: &mut BTreeMap<String, String>, canonical_kind: &str) {
+    insert_context_alias_pair(context, "repo", "repo_name");
+    insert_context_alias_pair(context, "session", "session_name");
+    insert_context_alias_pair(context, "channel", "channel_hint");
+
+    context
+        .entry("contract_event".to_string())
+        .or_insert_with(|| canonical_kind.to_string());
+    context
+        .entry("route_key".to_string())
+        .or_insert_with(|| canonical_kind.to_string());
+}
+
+fn insert_context_alias_pair(context: &mut BTreeMap<String, String>, primary: &str, alias: &str) {
+    let primary_value = context.get(primary).cloned();
+    let alias_value = context.get(alias).cloned();
+
+    match (primary_value, alias_value) {
+        (Some(primary_value), None) => {
+            context.insert(alias.to_string(), primary_value);
+        }
+        (None, Some(alias_value)) => {
+            context.insert(primary.to_string(), alias_value);
+        }
+        _ => {}
     }
 }
 
@@ -1072,6 +1131,59 @@ mod tests {
         let event = IncomingEvent::github_issue_opened("repo".into(), 42, "broken".into(), None);
         let rendered = render_template("{repo} #{number}: {title}", &event.template_context());
         assert_eq!(rendered, "repo #42: broken");
+    }
+
+    #[test]
+    fn template_context_backfills_repo_and_session_aliases() {
+        let git_event = IncomingEvent::git_commit(
+            "clawhip".into(),
+            "main".into(),
+            "1234567890abcdef".into(),
+            "ship it".into(),
+            None,
+        );
+        let git_context = git_event.template_context();
+        assert_eq!(git_context.get("repo").map(String::as_str), Some("clawhip"));
+        assert_eq!(
+            git_context.get("repo_name").map(String::as_str),
+            Some("clawhip")
+        );
+        assert_eq!(
+            git_context.get("event").map(String::as_str),
+            Some("git.commit")
+        );
+        assert_eq!(
+            git_context.get("contract_event").map(String::as_str),
+            Some("git.commit")
+        );
+        assert_eq!(
+            git_context.get("route_key").map(String::as_str),
+            Some("git.commit")
+        );
+
+        let tmux_event = IncomingEvent::tmux_keyword(
+            "issue-132".into(),
+            "error".into(),
+            "boom".into(),
+            Some("alerts".into()),
+        );
+        let tmux_context = tmux_event.template_context();
+        assert_eq!(
+            tmux_context.get("session").map(String::as_str),
+            Some("issue-132")
+        );
+        assert_eq!(
+            tmux_context.get("session_name").map(String::as_str),
+            Some("issue-132")
+        );
+        assert_eq!(
+            tmux_context.get("channel").map(String::as_str),
+            Some("alerts")
+        );
+        assert_eq!(
+            tmux_context.get("channel_hint").map(String::as_str),
+            Some("alerts")
+        );
     }
 
     #[test]

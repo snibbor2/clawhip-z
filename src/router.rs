@@ -1166,6 +1166,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn git_and_github_routes_can_filter_on_repo_name_alias() {
+        let config = AppConfig {
+            defaults: DefaultsConfig {
+                channel: Some("default".into()),
+                format: MessageFormat::Compact,
+            },
+            routes: vec![RouteRule {
+                event: "git.commit".into(),
+                sink: "discord".into(),
+                filter: [("repo_name".to_string(), "clawhip".to_string())]
+                    .into_iter()
+                    .collect(),
+                channel: Some("repo-name-route".into()),
+                webhook: None,
+                slack_webhook: None,
+                mention: None,
+                allow_dynamic_tokens: false,
+                format: None,
+                template: None,
+            }],
+            ..AppConfig::default()
+        };
+        let router = Router::new(Arc::new(config));
+        let event = IncomingEvent::git_commit(
+            "clawhip".into(),
+            "main".into(),
+            "1234567890abcdef".into(),
+            "ship it".into(),
+            None,
+        );
+
+        let (channel, _, _) = router.preview(&event).await.unwrap();
+        assert_eq!(channel, "repo-name-route");
+    }
+
+    #[tokio::test]
+    async fn tmux_and_session_routes_share_session_alias_filters() {
+        let tmux_config = AppConfig {
+            defaults: DefaultsConfig {
+                channel: Some("default".into()),
+                format: MessageFormat::Compact,
+            },
+            routes: vec![RouteRule {
+                event: "tmux.keyword".into(),
+                sink: "discord".into(),
+                filter: [("session_name".to_string(), "issue-*".to_string())]
+                    .into_iter()
+                    .collect(),
+                channel: Some("tmux-session-name".into()),
+                webhook: None,
+                slack_webhook: None,
+                mention: None,
+                allow_dynamic_tokens: false,
+                format: None,
+                template: None,
+            }],
+            ..AppConfig::default()
+        };
+        let tmux_router = Router::new(Arc::new(tmux_config));
+        let tmux_event =
+            IncomingEvent::tmux_keyword("issue-132".into(), "error".into(), "boom".into(), None);
+        let (tmux_channel, _, _) = tmux_router.preview(&tmux_event).await.unwrap();
+        assert_eq!(tmux_channel, "tmux-session-name");
+
+        let session_config = AppConfig {
+            defaults: DefaultsConfig {
+                channel: Some("default".into()),
+                format: MessageFormat::Compact,
+            },
+            routes: vec![RouteRule {
+                event: "session.started".into(),
+                sink: "discord".into(),
+                filter: [("session".to_string(), "issue-*".to_string())]
+                    .into_iter()
+                    .collect(),
+                channel: Some("session-alias-route".into()),
+                webhook: None,
+                slack_webhook: None,
+                mention: None,
+                allow_dynamic_tokens: false,
+                format: None,
+                template: None,
+            }],
+            ..AppConfig::default()
+        };
+        let session_router = Router::new(Arc::new(session_config));
+        let session_event = IncomingEvent {
+            kind: "session.started".into(),
+            channel: None,
+            mention: None,
+            format: None,
+            template: None,
+            payload: json!({
+                "session_name": "issue-132",
+                "tool": "omx"
+            }),
+        };
+
+        let (session_channel, _, _) = session_router.preview(&session_event).await.unwrap();
+        assert_eq!(session_channel, "session-alias-route");
+    }
+
+    #[tokio::test]
     async fn webhook_route_is_used_as_delivery_target() {
         let config = AppConfig {
             defaults: DefaultsConfig {

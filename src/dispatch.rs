@@ -367,7 +367,7 @@ impl RoutineDeliveryBatcher {
     }
 
     fn observe(&mut self, delivery: QueuedRoutineDelivery, now_ms: u64) {
-        let key = routine_batch_key(&delivery.delivery);
+        let key = routine_batch_key(&delivery);
         let batch =
             self.pending
                 .entry(key.clone())
@@ -691,11 +691,13 @@ fn should_bypass_routine_batch(event: &IncomingEvent) -> bool {
         || kind.starts_with("github.ci-")
 }
 
-fn routine_batch_key(delivery: &ResolvedDelivery) -> String {
+fn routine_batch_key(queued: &QueuedRoutineDelivery) -> String {
+    let delivery = &queued.delivery;
     let mention = normalized_delivery_text(delivery.mention.as_deref());
     let template = normalized_delivery_text(delivery.template.as_deref());
     format!(
-        "{}:{}:{}:{}:{}:{}",
+        "{}:{}:{}:{}:{}:{}:{}",
+        queued.event.canonical_kind(),
         delivery.sink,
         sink_target_key(&delivery.target),
         delivery.format.as_str(),
@@ -1273,6 +1275,87 @@ mod tests {
         );
         assert!(
             first.contains("\"content\":\"second\"") || second.contains("\"content\":\"second\"")
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatcher_keeps_distinct_event_kinds_in_separate_routine_batches() {
+        use tokio::time::{Duration, timeout};
+
+        let (webhook, mut requests, server) = spawn_webhook_collector(2).await;
+        let config = AppConfig {
+            routes: vec![
+                RouteRule {
+                    event: "tmux.keyword".into(),
+                    sink: "discord".into(),
+                    webhook: Some(webhook.clone()),
+                    ..RouteRule::default()
+                },
+                RouteRule {
+                    event: "git.commit".into(),
+                    sink: "discord".into(),
+                    webhook: Some(webhook),
+                    ..RouteRule::default()
+                },
+            ],
+            ..AppConfig::default()
+        };
+        let (tx, rx) = mpsc::channel(2);
+        let router = Router::new(Arc::new(config));
+        let mut dispatcher = test_dispatcher(rx, router)
+            .with_routine_batch_window(Some(Duration::from_millis(20)))
+            .with_batch_tick(Duration::from_millis(5));
+        let task = tokio::spawn(async move { dispatcher.run().await.unwrap() });
+
+        tx.send(IncomingEvent::tmux_keyword(
+            "issue-132".into(),
+            "error".into(),
+            "boom".into(),
+            None,
+        ))
+        .await
+        .unwrap();
+        tx.send(IncomingEvent::git_commit(
+            "clawhip".into(),
+            "main".into(),
+            "1234567890abcdef".into(),
+            "ship it".into(),
+            None,
+        ))
+        .await
+        .unwrap();
+
+        let first = timeout(Duration::from_secs(2), requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let second = timeout(Duration::from_secs(2), requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(tx);
+        task.await.unwrap();
+        server.await.unwrap();
+
+        assert!(
+            first.contains("tmux:issue-132 matched 'error' => boom")
+                || second.contains("tmux:issue-132 matched 'error' => boom")
+        );
+        assert!(
+            first.contains("git:clawhip@main 1234567 ship it")
+                || second.contains("git:clawhip@main 1234567 ship it")
+        );
+        assert!(
+            (first.contains("tmux:issue-132 matched 'error' => boom")
+                && !first.contains("git:clawhip@main 1234567 ship it"))
+                || (second.contains("tmux:issue-132 matched 'error' => boom")
+                    && !second.contains("git:clawhip@main 1234567 ship it"))
+        );
+        assert!(
+            (first.contains("git:clawhip@main 1234567 ship it")
+                && !first.contains("tmux:issue-132 matched 'error' => boom"))
+                || (second.contains("git:clawhip@main 1234567 ship it")
+                    && !second.contains("tmux:issue-132 matched 'error' => boom"))
         );
     }
 
