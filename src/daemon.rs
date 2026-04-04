@@ -9,7 +9,8 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router as AxumRouter};
 use serde_json::{Value, json};
-use tokio::sync::{RwLock, mpsc};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use tokio::sync::{RwLock, mpsc, watch};
 
 use crate::Result;
 use crate::VERSION;
@@ -27,18 +28,28 @@ use crate::source::{
 };
 
 const EVENT_QUEUE_CAPACITY: usize = 256;
+const HOT_RELOAD_SECTIONS: [&str; 3] = ["routes", "defaults", "cron"];
 
 #[derive(Clone)]
 struct AppState {
-    config: Arc<AppConfig>,
+    config: watch::Sender<Arc<AppConfig>>,
+    config_path: PathBuf,
+    reload_status: Arc<RwLock<ReloadStatus>>,
     port: u16,
     tx: mpsc::Sender<IncomingEvent>,
     tmux_registry: SharedTmuxRegistry,
 }
 
+#[derive(Debug, Clone, Default)]
+struct ReloadStatus {
+    generation: u64,
+    last_reloaded_at: Option<String>,
+}
+
 pub async fn run(
     config: Arc<AppConfig>,
     port_override: Option<u16>,
+    config_path: PathBuf,
     cron_state_path: PathBuf,
 ) -> Result<()> {
     config.validate()?;
@@ -52,7 +63,9 @@ pub async fn run(
     );
     sinks.insert("slack".into(), Box::new(SlackSink::default()));
     let renderer: Box<dyn Renderer> = Box::new(DefaultRenderer);
-    let router = Router::new(config.clone());
+    let (config_tx, config_rx) = watch::channel(config.clone());
+    let router = Router::from_receiver(config_rx);
+    let reload_status = Arc::new(RwLock::new(ReloadStatus::default()));
     let tmux_registry: SharedTmuxRegistry = Arc::new(RwLock::new(HashMap::new()));
     let (tx, rx) = mpsc::channel(EVENT_QUEUE_CAPACITY);
 
@@ -78,11 +91,15 @@ pub async fn run(
         tx.clone(),
     );
     spawn_source(WorkspaceSource::new(config.clone()), tx.clone());
-    spawn_source(CronSource::new(config.clone(), cron_state_path), tx.clone());
+    spawn_source(
+        CronSource::from_receiver(config_tx.subscribe(), cron_state_path),
+        tx.clone(),
+    );
 
     let app = AxumRouter::new()
         .route("/health", get(health))
         .route("/api/status", get(status))
+        .route("/api/config/reload", post(reload_config))
         .route("/event", post(post_event))
         .route("/api/event", post(post_event))
         .route("/events", post(post_event))
@@ -94,7 +111,9 @@ pub async fn run(
     let port = port_override.unwrap_or(config.daemon.port);
 
     let app = app.with_state(AppState {
-        config: config.clone(),
+        config: config_tx,
+        config_path,
+        reload_status,
         port,
         tx,
         tmux_registry,
@@ -149,14 +168,22 @@ fn source_failure_alert_event(source_name: &str, error_message: &str) -> Incomin
 
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
     let registered = state.tmux_registry.read().await.len();
+    let reload_status = state.reload_status.read().await.clone();
+    let config = state.config.borrow().clone();
     Json(health_payload(
-        state.config.as_ref(),
+        config.as_ref(),
         state.port,
         registered,
+        &reload_status,
     ))
 }
 
-fn health_payload(config: &AppConfig, port: u16, registered_tmux_sessions: usize) -> Value {
+fn health_payload(
+    config: &AppConfig,
+    port: u16,
+    registered_tmux_sessions: usize,
+    reload_status: &ReloadStatus,
+) -> Value {
     json!({
         "ok": true,
         "version": VERSION,
@@ -169,11 +196,64 @@ fn health_payload(config: &AppConfig, port: u16, registered_tmux_sessions: usize
         "configured_workspace_monitors": config.monitors.workspace.len(),
         "configured_cron_jobs": config.cron.jobs.len(),
         "registered_tmux_sessions": registered_tmux_sessions,
+        "config_reload_generation": reload_status.generation,
+        "last_config_reload_at": reload_status.last_reloaded_at,
+        "hot_reload_sections": HOT_RELOAD_SECTIONS,
     })
 }
 
 async fn status(State(state): State<AppState>) -> impl IntoResponse {
     health(State(state)).await
+}
+
+async fn reload_config(State(state): State<AppState>) -> impl IntoResponse {
+    let loaded = match AppConfig::load_or_default(&state.config_path) {
+        Ok(config) => config,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"ok": false, "error": error.to_string()})),
+            )
+                .into_response();
+        }
+    };
+
+    let current = state.config.borrow().clone();
+    let mut merged = current.as_ref().clone();
+    merged.apply_hot_reload_from(&loaded);
+
+    if let Err(error) = merged.validate() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"ok": false, "error": error.to_string()})),
+        )
+            .into_response();
+    }
+
+    let reloaded_at = now_rfc3339();
+    let generation = {
+        let mut reload_status = state.reload_status.write().await;
+        reload_status.generation += 1;
+        reload_status.last_reloaded_at = Some(reloaded_at.clone());
+        reload_status.generation
+    };
+
+    state.config.send_replace(Arc::new(merged.clone()));
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "config_reload_generation": generation,
+            "last_config_reload_at": reloaded_at,
+            "hot_reload_sections": HOT_RELOAD_SECTIONS,
+            "default_channel": merged.defaults.channel,
+            "default_format": merged.defaults.format.as_str(),
+            "configured_routes": merged.routes.len(),
+            "configured_cron_jobs": merged.cron.jobs.len(),
+        })),
+    )
+        .into_response()
 }
 
 async fn post_event(
@@ -248,7 +328,8 @@ async fn register_tmux(
 }
 
 async fn list_tmux(State(state): State<AppState>) -> impl IntoResponse {
-    match list_active_tmux_registrations(state.config.as_ref(), &state.tmux_registry).await {
+    let config = state.config.borrow().clone();
+    match list_active_tmux_registrations(config.as_ref(), &state.tmux_registry).await {
         Ok(registrations) => (StatusCode::OK, Json(json!(registrations))).into_response(),
         Err(error) => (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -375,6 +456,12 @@ async fn enqueue_event(tx: &mpsc::Sender<IncomingEvent>, event: IncomingEvent) -
         .map_err(|error| format!("event queue unavailable: {error}").into())
 }
 
+fn now_rfc3339() -> String {
+    let now = OffsetDateTime::now_utc();
+    now.format(&Rfc3339)
+        .unwrap_or_else(|_| now.unix_timestamp().to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -386,8 +473,21 @@ mod tests {
     use crate::source::tmux::{ParentProcessInfo, RegistrationSource};
     use axum::body::to_bytes;
     use std::fs;
+    use std::path::PathBuf;
     use tempfile::tempdir;
     use tokio::time::{Duration, timeout};
+
+    fn test_state(config: AppConfig, tx: mpsc::Sender<IncomingEvent>) -> AppState {
+        let (config_tx, _config_rx) = watch::channel(Arc::new(config));
+        AppState {
+            config: config_tx,
+            config_path: PathBuf::from("config.toml"),
+            reload_status: Arc::new(RwLock::new(ReloadStatus::default())),
+            port: 25294,
+            tx,
+            tmux_registry: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
 
     #[test]
     fn health_payload_includes_version_and_token_source() {
@@ -397,7 +497,7 @@ mod tests {
         config.monitors.tmux.sessions.push(Default::default());
         config.monitors.workspace.push(Default::default());
 
-        let payload = health_payload(&config, 25294, 3);
+        let payload = health_payload(&config, 25294, 3, &ReloadStatus::default());
 
         assert_eq!(payload["ok"], Value::Bool(true));
         assert_eq!(payload["version"], Value::String(VERSION.to_string()));
@@ -407,6 +507,7 @@ mod tests {
         assert_eq!(payload["configured_tmux_monitors"], Value::from(1));
         assert_eq!(payload["configured_workspace_monitors"], Value::from(1));
         assert_eq!(payload["registered_tmux_sessions"], Value::from(3));
+        assert_eq!(payload["config_reload_generation"], Value::from(0));
     }
 
     #[tokio::test]
@@ -485,12 +586,7 @@ mod tests {
     #[tokio::test]
     async fn post_event_returns_event_id_and_preserves_normalized_metadata() {
         let (tx, mut rx) = mpsc::channel(1);
-        let state = AppState {
-            config: Arc::new(AppConfig::default()),
-            port: 25294,
-            tx,
-            tmux_registry: Arc::new(RwLock::new(HashMap::new())),
-        };
+        let state = test_state(AppConfig::default(), tx);
         let event = IncomingEvent::agent_started(
             "worker-1".into(),
             Some("sess-123".into()),
@@ -525,12 +621,7 @@ mod tests {
     #[tokio::test]
     async fn post_omx_hook_accepts_native_hook_envelope_and_queues_normalized_event() {
         let (tx, mut rx) = mpsc::channel(1);
-        let state = AppState {
-            config: Arc::new(AppConfig::default()),
-            port: 25294,
-            tx,
-            tmux_registry: Arc::new(RwLock::new(HashMap::new())),
-        };
+        let state = test_state(AppConfig::default(), tx);
         let payload = json!({
             "schema_version": "1",
             "event": "session-start",
@@ -569,12 +660,7 @@ mod tests {
     #[tokio::test]
     async fn post_omx_hook_rejects_missing_normalized_event() {
         let (tx, _rx) = mpsc::channel(1);
-        let state = AppState {
-            config: Arc::new(AppConfig::default()),
-            port: 25294,
-            tx,
-            tmux_registry: Arc::new(RwLock::new(HashMap::new())),
-        };
+        let state = test_state(AppConfig::default(), tx);
         let payload = json!({
             "schema_version": "1",
             "event": "session-start",
@@ -621,12 +707,8 @@ mod tests {
                 active_wrapper_monitor: true,
             },
         );
-        let state = AppState {
-            config: Arc::new(AppConfig::default()),
-            port: 25294,
-            tx,
-            tmux_registry: registry,
-        };
+        let mut state = test_state(AppConfig::default(), tx);
+        state.tmux_registry = registry;
 
         let response = list_tmux(State(state)).await.into_response();
         assert_eq!(response.status(), StatusCode::OK);
@@ -649,5 +731,84 @@ mod tests {
             registrations[0]["parent_process"]["name"],
             Value::from("codex")
         );
+    }
+
+    #[tokio::test]
+    async fn reload_config_applies_only_reloadable_sections_from_disk() {
+        let dir = tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        let (tx, _rx) = mpsc::channel(1);
+
+        let mut initial = AppConfig::default();
+        initial.providers.discord.bot_token = Some("config-token".into());
+        initial.defaults.channel = Some("before".into());
+        initial.daemon.base_url = "http://127.0.0.1:25294".into();
+        initial.monitors.git.repos.push(Default::default());
+
+        let mut updated = AppConfig::default();
+        updated.defaults.channel = Some("after".into());
+        updated.daemon.base_url = "http://127.0.0.1:29999".into();
+        updated.routes.push(crate::config::RouteRule {
+            event: "custom".into(),
+            filter: Default::default(),
+            sink: crate::config::default_sink_name(),
+            channel: Some("ops".into()),
+            webhook: None,
+            slack_webhook: None,
+            mention: None,
+            allow_dynamic_tokens: false,
+            format: Some(MessageFormat::Alert),
+            template: None,
+        });
+        updated.cron.jobs.push(CronJob {
+            id: "dev-followup".into(),
+            schedule: "* * * * *".into(),
+            timezone: "UTC".into(),
+            enabled: true,
+            channel: Some("ops".into()),
+            mention: None,
+            format: Some(MessageFormat::Alert),
+            kind: CronJobKind::CustomMessage {
+                message: "check open PRs".into(),
+            },
+        });
+        updated.save(&config_path).expect("save config");
+
+        let mut state = test_state(initial.clone(), tx);
+        state.config_path = config_path;
+
+        let response = reload_config(State(state.clone())).await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let response_json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(response_json["configured_routes"], Value::from(1));
+        assert_eq!(response_json["configured_cron_jobs"], Value::from(1));
+        assert_eq!(response_json["config_reload_generation"], Value::from(1));
+
+        let reloaded = state.config.borrow().clone();
+        assert_eq!(reloaded.defaults.channel.as_deref(), Some("after"));
+        assert_eq!(reloaded.routes.len(), 1);
+        assert_eq!(reloaded.cron.jobs.len(), 1);
+        assert_eq!(reloaded.daemon.base_url, initial.daemon.base_url);
+        assert_eq!(
+            reloaded.monitors.git.repos.len(),
+            initial.monitors.git.repos.len()
+        );
+
+        let router = Router::from_receiver(state.config.subscribe());
+        let delivery = router
+            .preview_delivery(&IncomingEvent::custom(None, "check open PRs".into()))
+            .await
+            .expect("delivery");
+        assert_eq!(delivery.target, SinkTarget::DiscordChannel("ops".into()));
+
+        let health = health(State(state)).await.into_response();
+        let body = to_bytes(health.into_body(), usize::MAX).await.unwrap();
+        let health_json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(health_json["configured_cron_jobs"], Value::from(1));
+        assert_eq!(health_json["configured_git_monitors"], Value::from(1));
+        assert_eq!(health_json["config_reload_generation"], Value::from(1));
+        assert!(health_json["last_config_reload_at"].is_string());
     }
 }

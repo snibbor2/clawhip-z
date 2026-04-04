@@ -65,6 +65,10 @@ impl DaemonClient {
         }
     }
 
+    pub async fn reload_config(&self) -> Result<Value> {
+        self.post_json("/api/config/reload", &Value::Null).await
+    }
+
     async fn post_json<T: Serialize>(&self, path: &str, payload: &T) -> Result<Value> {
         let response = self
             .http

@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use serde_json::json;
+use tokio::sync::watch;
 
 use crate::Result;
 use crate::config::{AppConfig, RouteRule, default_sink_name};
@@ -26,12 +27,25 @@ pub struct ResolvedDelivery {
 }
 
 pub struct Router {
-    config: Arc<AppConfig>,
+    config: ConfigHandle,
+}
+
+enum ConfigHandle {
+    Static(Arc<AppConfig>),
+    Dynamic(watch::Receiver<Arc<AppConfig>>),
 }
 
 impl Router {
     pub fn new(config: Arc<AppConfig>) -> Self {
-        Self { config }
+        Self {
+            config: ConfigHandle::Static(config),
+        }
+    }
+
+    pub fn from_receiver(config: watch::Receiver<Arc<AppConfig>>) -> Self {
+        Self {
+            config: ConfigHandle::Dynamic(config),
+        }
     }
 
     #[cfg(test)]
@@ -60,7 +74,8 @@ impl Router {
     }
 
     pub async fn resolve(&self, event: &IncomingEvent) -> Result<Vec<ResolvedDelivery>> {
-        let routes = self.routes_for(event);
+        let config = self.current_config();
+        let routes = self.routes_for(config.as_ref(), event);
         let routes = if routes.is_empty() {
             vec![None]
         } else {
@@ -69,7 +84,7 @@ impl Router {
         let mut deliveries = Vec::with_capacity(routes.len());
 
         for route in routes {
-            deliveries.push(self.resolve_delivery(event, route)?);
+            deliveries.push(self.resolve_delivery(config.as_ref(), event, route)?);
         }
 
         Ok(deliveries)
@@ -87,6 +102,7 @@ impl Router {
 
     fn resolve_delivery(
         &self,
+        config: &AppConfig,
         event: &IncomingEvent,
         route: Option<&RouteRule>,
     ) -> Result<ResolvedDelivery> {
@@ -94,12 +110,12 @@ impl Router {
             .map(RouteRule::effective_sink)
             .map(ToString::to_string)
             .unwrap_or_else(default_sink_name);
-        let target = self.target_for(event, route, &sink)?;
+        let target = self.target_for(config, event, route, &sink)?;
         let format = event
             .format
             .clone()
             .or_else(|| route.and_then(|route| route.format.clone()))
-            .unwrap_or_else(|| self.config.defaults.format.clone());
+            .unwrap_or_else(|| config.defaults.format.clone());
 
         Ok(ResolvedDelivery {
             sink,
@@ -112,7 +128,7 @@ impl Router {
                 .template
                 .clone()
                 .or_else(|| route.and_then(|route| route.template.clone())),
-            allow_dynamic_tokens: self.allow_dynamic_tokens_for(event, route),
+            allow_dynamic_tokens: self.allow_dynamic_tokens_for(config, event, route),
         })
     }
 
@@ -167,7 +183,12 @@ impl Router {
         }
     }
 
-    fn allow_dynamic_tokens_for(&self, event: &IncomingEvent, route: Option<&RouteRule>) -> bool {
+    fn allow_dynamic_tokens_for(
+        &self,
+        config: &AppConfig,
+        event: &IncomingEvent,
+        route: Option<&RouteRule>,
+    ) -> bool {
         if let Some(route) = route {
             return route.allow_dynamic_tokens;
         }
@@ -175,7 +196,7 @@ impl Router {
         if event.canonical_kind() == "custom"
             && let Some(channel) = event.channel.as_deref()
         {
-            return self.config.routes.iter().any(|route| {
+            return config.routes.iter().any(|route| {
                 route.allow_dynamic_tokens && route.channel.as_deref() == Some(channel)
             });
         }
@@ -183,9 +204,9 @@ impl Router {
         false
     }
 
-    fn routes_for<'a>(&'a self, event: &IncomingEvent) -> Vec<&'a RouteRule> {
+    fn routes_for<'a>(&self, config: &'a AppConfig, event: &IncomingEvent) -> Vec<&'a RouteRule> {
         let context = event.template_context();
-        self.config
+        config
             .routes
             .iter()
             .filter(|route| route_matches(route, event.canonical_kind(), &context))
@@ -194,6 +215,7 @@ impl Router {
 
     fn target_for(
         &self,
+        config: &AppConfig,
         event: &IncomingEvent,
         route: Option<&RouteRule>,
         sink: &str,
@@ -212,12 +234,12 @@ impl Router {
                         .channel
                         .clone()
                         .or_else(|| route.and_then(|route| route.channel.clone()))
-                        .or_else(|| self.config.defaults.channel.clone())
+                        .or_else(|| config.defaults.channel.clone())
                 } else {
                     route
                         .and_then(|route| route.channel.clone())
                         .or_else(|| event.channel.clone())
-                        .or_else(|| self.config.defaults.channel.clone())
+                        .or_else(|| config.defaults.channel.clone())
                 }
                 .ok_or_else(|| {
                     format!("no channel configured for event {}", event.canonical_kind())
@@ -240,6 +262,13 @@ impl Router {
                 event.canonical_kind()
             )
             .into()),
+        }
+    }
+
+    fn current_config(&self) -> Arc<AppConfig> {
+        match &self.config {
+            ConfigHandle::Static(config) => config.clone(),
+            ConfigHandle::Dynamic(config) => config.borrow().clone(),
         }
     }
 }

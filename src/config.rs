@@ -530,6 +530,12 @@ impl AppConfig {
         Ok(toml::to_string_pretty(self)?)
     }
 
+    pub fn apply_hot_reload_from(&mut self, updated: &Self) {
+        self.defaults = updated.defaults.clone();
+        self.routes = updated.routes.clone();
+        self.cron = updated.cron.clone();
+    }
+
     pub fn save(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -1444,5 +1450,54 @@ poll_interval_secs = 9
         let config = AppConfig::load_or_default(&path).unwrap();
         assert!(config.monitors.workspace.is_empty());
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn hot_reload_updates_only_routes_defaults_and_cron() {
+        let mut current = AppConfig::default();
+        current.daemon.base_url = "http://127.0.0.1:25294".into();
+        current.defaults.channel = Some("before".into());
+        current.monitors.git.repos.push(GitRepoMonitor {
+            path: ".".into(),
+            name: Some("repo".into()),
+            channel: Some("git".into()),
+            ..GitRepoMonitor::default()
+        });
+
+        let mut updated = AppConfig::default();
+        updated.daemon.base_url = "http://127.0.0.1:29999".into();
+        updated.defaults.channel = Some("after".into());
+        updated.routes.push(RouteRule {
+            event: "custom".into(),
+            filter: BTreeMap::new(),
+            sink: default_sink_name(),
+            channel: Some("ops".into()),
+            webhook: None,
+            slack_webhook: None,
+            mention: None,
+            allow_dynamic_tokens: false,
+            format: None,
+            template: None,
+        });
+        updated.cron.jobs.push(CronJob {
+            id: "dev-followup".into(),
+            schedule: "* * * * *".into(),
+            timezone: "UTC".into(),
+            enabled: true,
+            channel: Some("ops".into()),
+            mention: None,
+            format: Some(MessageFormat::Alert),
+            kind: CronJobKind::CustomMessage {
+                message: "check open PRs".into(),
+            },
+        });
+
+        current.apply_hot_reload_from(&updated);
+
+        assert_eq!(current.defaults.channel.as_deref(), Some("after"));
+        assert_eq!(current.routes.len(), 1);
+        assert_eq!(current.cron.jobs.len(), 1);
+        assert_eq!(current.daemon.base_url, "http://127.0.0.1:25294");
+        assert_eq!(current.monitors.git.repos.len(), 1);
     }
 }

@@ -7,8 +7,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use time::{OffsetDateTime, Weekday};
-use tokio::sync::mpsc;
-use tokio::time::{MissedTickBehavior, interval};
+use tokio::sync::{mpsc, watch};
+use tokio::time::sleep;
 
 use crate::Result;
 use crate::client::DaemonClient;
@@ -17,13 +17,35 @@ use crate::events::IncomingEvent;
 use crate::source::Source;
 
 pub struct CronSource {
-    config: Arc<AppConfig>,
+    config: ConfigHandle,
     state_path: PathBuf,
+}
+
+enum ConfigHandle {
+    Static(Arc<AppConfig>),
+    Dynamic(watch::Receiver<Arc<AppConfig>>),
 }
 
 impl CronSource {
     pub fn new(config: Arc<AppConfig>, state_path: PathBuf) -> Self {
-        Self { config, state_path }
+        Self {
+            config: ConfigHandle::Static(config),
+            state_path,
+        }
+    }
+
+    pub fn from_receiver(config: watch::Receiver<Arc<AppConfig>>, state_path: PathBuf) -> Self {
+        Self {
+            config: ConfigHandle::Dynamic(config),
+            state_path,
+        }
+    }
+
+    fn current_config(&self) -> Arc<AppConfig> {
+        match &self.config {
+            ConfigHandle::Static(config) => config.clone(),
+            ConfigHandle::Dynamic(config) => config.borrow().clone(),
+        }
     }
 }
 
@@ -34,22 +56,76 @@ impl Source for CronSource {
     }
 
     async fn run(&self, tx: mpsc::Sender<IncomingEvent>) -> Result<()> {
-        if self.config.cron.jobs.is_empty() {
-            return Ok(());
-        }
-
+        let mut config_rx = match &self.config {
+            ConfigHandle::Static(_) => None,
+            ConfigHandle::Dynamic(config) => Some(config.clone()),
+        };
+        let mut config = self.current_config();
         let mut scheduler =
-            CronScheduler::new_with_state_path(self.config.as_ref(), self.state_path.clone())?;
-        let mut tick = interval(Duration::from_secs(
-            self.config.cron.poll_interval_secs.max(1),
-        ));
-        tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            CronScheduler::new_with_state_path(config.as_ref(), self.state_path.clone())?;
+        let mut current_signature = cron_signature(config.as_ref());
 
         loop {
-            tick.tick().await;
+            refresh_scheduler_if_needed(
+                &mut scheduler,
+                &mut current_signature,
+                config.as_ref(),
+                &self.state_path,
+            )?;
+
+            if scheduler.is_empty() {
+                let Some(receiver) = config_rx.as_mut() else {
+                    return Ok(());
+                };
+                if receiver.changed().await.is_err() {
+                    return Ok(());
+                }
+                config = receiver.borrow_and_update().clone();
+                continue;
+            }
+
             scheduler.emit_due(&tx, OffsetDateTime::now_utc()).await?;
+
+            let poll_interval = Duration::from_secs(config.cron.poll_interval_secs.max(1));
+            if let Some(receiver) = config_rx.as_mut() {
+                tokio::select! {
+                    _ = sleep(poll_interval) => {
+                        config = receiver.borrow().clone();
+                    }
+                    changed = receiver.changed() => {
+                        if changed.is_err() {
+                            return Ok(());
+                        }
+                        config = receiver.borrow_and_update().clone();
+                    }
+                }
+            } else {
+                sleep(poll_interval).await;
+            }
         }
     }
+}
+
+fn cron_signature(config: &AppConfig) -> String {
+    format!(
+        "{}:{}",
+        config.cron.poll_interval_secs,
+        toml::to_string(&config.cron).unwrap_or_default()
+    )
+}
+
+fn refresh_scheduler_if_needed(
+    scheduler: &mut CronScheduler,
+    current_signature: &mut String,
+    config: &AppConfig,
+    state_path: &Path,
+) -> Result<()> {
+    let next_signature = cron_signature(config);
+    if next_signature != *current_signature {
+        *scheduler = CronScheduler::new_with_state_path(config, state_path.to_path_buf())?;
+        *current_signature = next_signature;
+    }
+    Ok(())
 }
 
 #[async_trait::async_trait]
@@ -153,6 +229,10 @@ impl CronScheduler {
             last_processed_minute,
             state_path,
         })
+    }
+
+    fn is_empty(&self) -> bool {
+        self.jobs.is_empty()
     }
 
     async fn emit_due<E>(&mut self, emitter: &E, now: OffsetDateTime) -> Result<Vec<String>>
@@ -455,11 +535,10 @@ fn save_scheduler_state(path: &Path, state: &CronSchedulerState) -> Result<()> {
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use tempfile::tempdir;
-    use time::{Date, Month, PrimitiveDateTime, Time};
-
     use crate::config::{CronConfig, DefaultsConfig};
     use crate::events::MessageFormat;
+    use tempfile::tempdir;
+    use time::{Date, Month, PrimitiveDateTime, Time};
 
     use super::*;
 
@@ -552,6 +631,33 @@ mod tests {
 
         let events = emitter.events.lock().expect("events lock");
         assert_eq!(events.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn cron_refresh_rebuilds_scheduler_for_reloaded_config() {
+        let dir = tempdir().expect("tempdir");
+        let state_path = dir.path().join("cron-state.json");
+        let emitter = RecordingEmitter::default();
+        let mut scheduler =
+            CronScheduler::new_with_state_path(&AppConfig::default(), state_path.clone())
+                .expect("initial scheduler");
+        let mut signature = cron_signature(&AppConfig::default());
+        let reloaded = sample_config("* * * * *");
+
+        refresh_scheduler_if_needed(&mut scheduler, &mut signature, &reloaded, &state_path)
+            .expect("refresh scheduler");
+        scheduler
+            .emit_due(&emitter, dt(2026, Month::April, 2, 8, 20, 3))
+            .await
+            .expect("emit reloaded job");
+
+        let events = emitter.events.lock().expect("events lock");
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+
+        assert_eq!(event.kind, "custom");
+        assert_eq!(event.channel.as_deref(), Some("ops"));
+        assert_eq!(event.payload["cron_job_id"], json!("dev-followup"));
     }
 
     #[test]

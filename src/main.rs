@@ -59,7 +59,9 @@ async fn real_main() -> Result<()> {
     let cron_state_path = crate::cron::default_state_path(&config_path);
 
     match cli.command.unwrap_or(Commands::Start { port: None }) {
-        Commands::Start { port } => daemon::run(config, port, cron_state_path).await,
+        Commands::Start { port } => {
+            daemon::run(config, port, config_path.clone(), cron_state_path).await
+        }
         Commands::Status => {
             let client = DaemonClient::from_config(config.as_ref());
             let health = client.health().await?;
@@ -240,6 +242,12 @@ async fn real_main() -> Result<()> {
             }
             ConfigCommand::Path => {
                 println!("{}", config_path.display());
+                Ok(())
+            }
+            ConfigCommand::Reload => {
+                let client = DaemonClient::from_config(config.as_ref());
+                let response = client.reload_config().await?;
+                println!("{}", serde_json::to_string_pretty(&response)?);
                 Ok(())
             }
         },

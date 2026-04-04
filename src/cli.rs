@@ -499,6 +499,8 @@ pub enum ConfigCommand {
     Interactive,
     Show,
     Path,
+    /// Ask the running daemon to hot-reload routes/defaults/cron from disk.
+    Reload,
 }
 
 #[cfg(test)]
@@ -963,5 +965,16 @@ mod tests {
 
         assert!(systemd);
         assert!(skip_star_prompt);
+    }
+
+    #[test]
+    fn parses_config_reload_subcommand() {
+        let cli = Cli::parse_from(["clawhip", "config", "reload"]);
+
+        let Commands::Config { command } = cli.command.expect("config command") else {
+            panic!("expected config command");
+        };
+
+        assert!(matches!(command, Some(ConfigCommand::Reload)));
     }
 }
