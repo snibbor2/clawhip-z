@@ -234,24 +234,18 @@ impl Renderer for DefaultRenderer {
             ) => serde_json::to_string_pretty(payload)?,
 
             (
-                "github.release-published"
-                | "github.release-prereleased"
-                | "github.release-edited",
+                "github.release-published" | "github.release-prereleased" | "github.release-edited",
                 MessageFormat::Compact,
             ) => render_github_release(payload, event.canonical_kind())?,
             (
-                "github.release-published"
-                | "github.release-prereleased"
-                | "github.release-edited",
+                "github.release-published" | "github.release-prereleased" | "github.release-edited",
                 MessageFormat::Alert,
             ) => format!(
                 "🚨 {}",
                 render_github_release(payload, event.canonical_kind())?
             ),
             (
-                "github.release-published"
-                | "github.release-prereleased"
-                | "github.release-edited",
+                "github.release-published" | "github.release-prereleased" | "github.release-edited",
                 MessageFormat::Inline,
             ) => {
                 let tag = string_field(payload, "tag")?;
@@ -264,9 +258,7 @@ impl Renderer for DefaultRenderer {
                 format!("[release] {repo} {tag}{suffix}")
             }
             (
-                "github.release-published"
-                | "github.release-prereleased"
-                | "github.release-edited",
+                "github.release-published" | "github.release-prereleased" | "github.release-edited",
                 MessageFormat::Raw,
             ) => serde_json::to_string_pretty(payload)?,
 

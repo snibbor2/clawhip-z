@@ -104,9 +104,15 @@ fn body_for(kind: &str, payload: &Value) -> Result<EventBody> {
         )?)),
         "github.issue-closed" => Ok(EventBody::GitHubIssueClosed(github_issue_event(payload)?)),
         "github.pr-status-changed" => github_pr_body(payload),
-        "github.release-published" => Ok(EventBody::GitHubReleasePublished(github_release_event(payload)?)),
-        "github.release-prereleased" => Ok(EventBody::GitHubReleasePrereleased(github_release_event(payload)?)),
-        "github.release-edited" => Ok(EventBody::GitHubReleaseEdited(github_release_event(payload)?)),
+        "github.release-published" => Ok(EventBody::GitHubReleasePublished(github_release_event(
+            payload,
+        )?)),
+        "github.release-prereleased" => Ok(EventBody::GitHubReleasePrereleased(
+            github_release_event(payload)?,
+        )),
+        "github.release-edited" => Ok(EventBody::GitHubReleaseEdited(github_release_event(
+            payload,
+        )?)),
         "github.ci-failed" => Ok(EventBody::GitHubCIFailed(GitHubCIEvent {
             repo: string_field(payload, "repo")?,
             number: payload.get("number").and_then(Value::as_u64),
@@ -950,9 +956,6 @@ mod tests {
 
         let envelope = from_incoming_event(&event).unwrap();
         assert_eq!(envelope.metadata.priority, EventPriority::Normal);
-        assert!(matches!(
-            envelope.body,
-            EventBody::GitHubReleaseEdited(_)
-        ));
+        assert!(matches!(envelope.body, EventBody::GitHubReleaseEdited(_)));
     }
 }
