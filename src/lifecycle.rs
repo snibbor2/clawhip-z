@@ -34,11 +34,29 @@ pub fn update(restart: bool) -> Result<()> {
         .arg(&repo_root)
         .arg("pull")
         .arg("--ff-only"))?;
-    run(Command::new("cargo")
-        .arg("install")
-        .arg("--path")
-        .arg(&repo_root)
-        .arg("--force"))?;
+
+    // If ~/.cargo/bin/clawhip is a symlink into this repo's target/release/,
+    // just build in-place — the symlink picks up the new binary automatically.
+    // Otherwise use cargo install so the binary in PATH is replaced.
+    let bin_path = cargo_bin_dir().join("clawhip");
+    let is_symlink_to_target = fs::read_link(&bin_path)
+        .ok()
+        .map(|target| target.starts_with(repo_root.join("target")))
+        .unwrap_or(false);
+
+    if is_symlink_to_target {
+        run(Command::new("cargo")
+            .arg("build")
+            .arg("--release")
+            .current_dir(&repo_root))?;
+    } else {
+        run(Command::new("cargo")
+            .arg("install")
+            .arg("--path")
+            .arg(&repo_root)
+            .arg("--force"))?;
+    }
+
     ensure_config_dir()?;
     plugins::install_bundled_plugins(&config_dir().join("plugins"))?;
     if restart {
