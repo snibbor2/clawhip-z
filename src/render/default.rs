@@ -274,6 +274,73 @@ impl Renderer for DefaultRenderer {
             ),
             ("tmux.stale", MessageFormat::Raw) => serde_json::to_string_pretty(payload)?,
 
+            ("tmux.content_changed", MessageFormat::Compact) => {
+                let session = string_field(payload, "session")?;
+                if content_mode(payload) == "raw" {
+                    let raw = string_field(payload, "raw_truncated")?;
+                    format!("📋 **{session}**: {raw}")
+                } else {
+                    let summary = string_field(payload, "summary")?;
+                    format!("🤖 **{session}**: {summary}")
+                }
+            }
+            ("tmux.content_changed", MessageFormat::Alert) => {
+                let session = string_field(payload, "session")?;
+                if content_mode(payload) == "raw" {
+                    let raw = string_field(payload, "raw_truncated")?;
+                    format!("📋 **{session}**\n```\n{raw}\n```")
+                } else {
+                    let summary = string_field(payload, "summary")?;
+                    format!("🤖 **{session}**\n{summary}")
+                }
+            }
+            ("tmux.content_changed", MessageFormat::Inline) => {
+                let session = string_field(payload, "session")?;
+                if content_mode(payload) == "raw" {
+                    format!("📋 [{session}]")
+                } else {
+                    let summary = string_field(payload, "summary")?;
+                    format!("🤖 [{session}] {summary}")
+                }
+            }
+            ("tmux.content_changed", MessageFormat::Raw) => serde_json::to_string_pretty(payload)?,
+
+            ("tmux.waiting_for_input", MessageFormat::Compact) => {
+                let session = string_field(payload, "session")?;
+                let prompt = optional_string_field(payload, "prompt_snapshot")
+                    .unwrap_or_else(|| "no prompt".to_string());
+                format!("⏳ **{session}**:\n```\n{prompt}\n```")
+            }
+            ("tmux.waiting_for_input", MessageFormat::Alert) => {
+                let session = string_field(payload, "session")?;
+                let prompt = optional_string_field(payload, "prompt_snapshot")
+                    .unwrap_or_else(|| "no prompt".to_string());
+                format!("⏳ **{session}**:\n```\n{prompt}\n```")
+            }
+            ("tmux.waiting_for_input", MessageFormat::Inline) => {
+                let session = string_field(payload, "session")?;
+                format!("⏳ [{session}]")
+            }
+            ("tmux.waiting_for_input", MessageFormat::Raw) => {
+                serde_json::to_string_pretty(payload)?
+            }
+
+            ("tmux.heartbeat", MessageFormat::Compact) => {
+                let session = string_field(payload, "session")?;
+                let minutes = payload.field_u64("minutes_since_change")?;
+                format!("💓 **{session}**: idle for {minutes}m")
+            }
+            ("tmux.heartbeat", MessageFormat::Alert) => {
+                let session = string_field(payload, "session")?;
+                let minutes = payload.field_u64("minutes_since_change")?;
+                format!("💓 **{session}**: idle for {minutes}m")
+            }
+            ("tmux.heartbeat", MessageFormat::Inline) => {
+                let session = string_field(payload, "session")?;
+                format!("💓 [{session}]")
+            }
+            ("tmux.heartbeat", MessageFormat::Raw) => serde_json::to_string_pretty(payload)?,
+
             (_, MessageFormat::Raw) => serde_json::to_string_pretty(payload)?,
             (_, _) => serde_json::to_string(payload)?,
         };
@@ -299,6 +366,10 @@ fn optional_string_field(payload: &Value, key: &str) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
+}
+
+fn content_mode(payload: &Value) -> String {
+    optional_string_field(payload, "content_mode").unwrap_or_else(|| "summary".to_string())
 }
 
 fn optional_u64_field(payload: &Value, key: &str) -> Option<u64> {
@@ -817,5 +888,88 @@ mod tests {
             .render(&event, &MessageFormat::Compact)
             .unwrap();
         assert_eq!(rendered, "git:repo@main 1234567 ship it");
+    }
+
+    #[test]
+    fn renders_tmux_content_changed_formats() {
+        let renderer = DefaultRenderer;
+        let event = IncomingEvent::tmux_content_changed_with_metadata(
+            "issue-24".into(),
+            "0.1".into(),
+            "Agent fixed the failing test".into(),
+            "tail".into(),
+            "gemini-cli".into(),
+            "summary".into(),
+            None,
+        );
+
+        assert_eq!(
+            renderer.render(&event, &MessageFormat::Compact).unwrap(),
+            "🤖 **issue-24**: Agent fixed the failing test"
+        );
+        assert_eq!(
+            renderer.render(&event, &MessageFormat::Inline).unwrap(),
+            "🤖 [issue-24] Agent fixed the failing test"
+        );
+    }
+
+    #[test]
+    fn renders_tmux_content_changed_raw_formats() {
+        let renderer = DefaultRenderer;
+        let event = IncomingEvent::tmux_content_changed_with_metadata(
+            "issue-24".into(),
+            "0.1".into(),
+            "ignored".into(),
+            "cargo build\nerror: failed".into(),
+            "raw".into(),
+            "raw".into(),
+            None,
+        );
+
+        assert_eq!(
+            renderer.render(&event, &MessageFormat::Compact).unwrap(),
+            "📋 **issue-24**: cargo build\nerror: failed"
+        );
+        assert_eq!(
+            renderer.render(&event, &MessageFormat::Inline).unwrap(),
+            "📋 [issue-24]"
+        );
+    }
+
+    #[test]
+    fn renders_tmux_waiting_for_input_formats() {
+        let renderer = DefaultRenderer;
+        let event = IncomingEvent::tmux_waiting_for_input(
+            "issue-24".into(),
+            "0.1".into(),
+            "Press enter to continue".into(),
+            None,
+        );
+
+        assert_eq!(
+            renderer.render(&event, &MessageFormat::Inline).unwrap(),
+            "⏳ [issue-24]"
+        );
+        assert!(
+            renderer
+                .render(&event, &MessageFormat::Compact)
+                .unwrap()
+                .starts_with("⏳ **issue-24**")
+        );
+    }
+
+    #[test]
+    fn renders_tmux_heartbeat_formats() {
+        let renderer = DefaultRenderer;
+        let event = IncomingEvent::tmux_heartbeat("issue-24".into(), 42, None);
+
+        assert_eq!(
+            renderer.render(&event, &MessageFormat::Compact).unwrap(),
+            "💓 **issue-24**: idle for 42m"
+        );
+        assert_eq!(
+            renderer.render(&event, &MessageFormat::Inline).unwrap(),
+            "💓 [issue-24]"
+        );
     }
 }

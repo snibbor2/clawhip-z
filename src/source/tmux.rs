@@ -16,6 +16,7 @@ use crate::events::{IncomingEvent, MessageFormat};
 use crate::keyword_window::{PendingKeywordHits, collect_keyword_hits};
 use crate::router::glob_match;
 use crate::source::Source;
+use crate::summarize::{SummarizedContent, build_summarizer};
 
 pub type SharedTmuxRegistry = Arc<RwLock<HashMap<String, RegisteredTmuxSession>>>;
 
@@ -44,7 +45,7 @@ pub struct ParentProcessInfo {
     pub name: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RegisteredTmuxSession {
     pub session: String,
     pub channel: Option<String>,
@@ -63,6 +64,14 @@ pub struct RegisteredTmuxSession {
     pub parent_process: Option<ParentProcessInfo>,
     #[serde(default)]
     pub active_wrapper_monitor: bool,
+    #[serde(default)]
+    pub summarize: bool,
+    #[serde(default)]
+    pub summarizer: String,
+    #[serde(default)]
+    pub heartbeat_mins: u64,
+    #[serde(default)]
+    pub detect_waiting: bool,
 }
 
 impl From<&TmuxSessionMonitor> for RegisteredTmuxSession {
@@ -79,6 +88,10 @@ impl From<&TmuxSessionMonitor> for RegisteredTmuxSession {
             registration_source: RegistrationSource::ConfigMonitor,
             parent_process: None,
             active_wrapper_monitor: false,
+            summarize: value.summarize,
+            summarizer: value.summarizer.clone(),
+            heartbeat_mins: value.heartbeat_mins,
+            detect_waiting: value.detect_waiting,
         }
     }
 }
@@ -147,6 +160,7 @@ struct TmuxPaneState {
 struct TmuxMonitorState {
     panes: HashMap<String, TmuxPaneState>,
     pending_keyword_hits: HashMap<String, PendingKeywordHits>,
+    session_last_heartbeat: HashMap<String, Instant>,
 }
 
 struct TmuxPaneSnapshot {
@@ -162,6 +176,7 @@ pub async fn monitor_registered_session(
 ) -> Result<()> {
     let mut panes = HashMap::new();
     let mut pending_keyword_hits = None;
+    let mut last_heartbeat = None;
     let poll_interval = Duration::from_secs(1);
 
     loop {
@@ -213,6 +228,7 @@ pub async fn monitor_registered_session(
                             last_stale_notification: None,
                         },
                     );
+                    last_heartbeat = Some(now);
                 }
                 Some(existing) => {
                     if existing.content_hash != hash {
@@ -223,12 +239,36 @@ pub async fn monitor_registered_session(
                         );
                         push_pending_keyword_hits(&mut pending_keyword_hits, now, hits);
 
+                        if registration.summarize {
+                            spawn_content_changed_task(
+                                client.clone(),
+                                registration.clone(),
+                                pane.session.clone(),
+                                pane.pane_name.clone(),
+                                pane.content.clone(),
+                            );
+                        }
+
+                        if registration.detect_waiting
+                            && let Some(prompt) = is_waiting_for_input(&pane.content)
+                        {
+                            client
+                                .emit(tmux_waiting_for_input_event(
+                                    &registration,
+                                    pane.session.clone(),
+                                    pane.pane_name.clone(),
+                                    prompt,
+                                ))
+                                .await?;
+                        }
+
                         existing.session = pane.session;
                         existing.pane_name = pane.pane_name;
                         existing.content_hash = hash;
                         existing.snapshot = pane.content;
                         existing.last_change = now;
                         existing.last_stale_notification = None;
+                        last_heartbeat = Some(now);
                     } else if should_emit_stale(existing, now, registration.stale_minutes) {
                         client
                             .emit(tmux_stale_event(
@@ -245,6 +285,14 @@ pub async fn monitor_registered_session(
         }
 
         panes.retain(|pane_id, _| active_panes.contains(pane_id));
+        maybe_emit_registered_session_heartbeat(
+            &registration,
+            &client,
+            &panes,
+            &mut last_heartbeat,
+            Instant::now(),
+        )
+        .await?;
         sleep(poll_interval).await;
     }
 
@@ -304,6 +352,7 @@ async fn poll_tmux(
     for (session_name, registration) in &sessions {
         if registration.active_wrapper_monitor {
             state.pending_keyword_hits.remove(session_name);
+            state.session_last_heartbeat.remove(session_name);
             continue;
         }
 
@@ -331,6 +380,7 @@ async fn poll_tmux(
                 )
                 .await?;
                 state.panes.retain(|_, pane| pane.session != *session_name);
+                state.session_last_heartbeat.remove(session_name);
                 continue;
             }
             Err(error) => {
@@ -345,6 +395,7 @@ async fn poll_tmux(
 
         match snapshot_tmux_session(session_name).await {
             Ok(panes) => {
+                let mut session_changed = false;
                 for pane in panes {
                     let pane_key = format!("{}::{}", pane.session, pane.pane_id);
                     active_panes.insert(pane_key.clone());
@@ -365,6 +416,10 @@ async fn poll_tmux(
                                     last_stale_notification: None,
                                 },
                             );
+                            state
+                                .session_last_heartbeat
+                                .insert(session_name.clone(), now);
+                            session_changed = true;
                             None
                         }
                         Some(existing) => {
@@ -374,11 +429,35 @@ async fn poll_tmux(
                                     &pane.content,
                                     &registration.keywords,
                                 );
+                                if registration.summarize {
+                                    spawn_content_changed_task(
+                                        tx.clone(),
+                                        registration.clone(),
+                                        session_name.clone(),
+                                        pane.pane_name.clone(),
+                                        pane.content.clone(),
+                                    );
+                                }
+                                if registration.detect_waiting
+                                    && let Some(prompt) = is_waiting_for_input(&pane.content)
+                                {
+                                    tx.emit(tmux_waiting_for_input_event(
+                                        registration,
+                                        session_name.clone(),
+                                        pane.pane_name.clone(),
+                                        prompt,
+                                    ))
+                                    .await?;
+                                }
                                 existing.pane_name = pane.pane_name;
                                 existing.snapshot = pane.content;
                                 existing.content_hash = hash;
                                 existing.last_change = now;
                                 existing.last_stale_notification = None;
+                                state
+                                    .session_last_heartbeat
+                                    .insert(session_name.clone(), now);
+                                session_changed = true;
                                 Some(hits)
                             } else {
                                 if should_emit_stale(existing, now, registration.stale_minutes) {
@@ -405,6 +484,15 @@ async fn poll_tmux(
                         );
                     }
                 }
+                maybe_emit_session_heartbeat(
+                    session_name,
+                    registration,
+                    tx,
+                    state,
+                    Instant::now(),
+                    session_changed,
+                )
+                .await?;
             }
             Err(error) => eprintln!(
                 "clawhip source tmux snapshot failed for {}: {error}",
@@ -424,6 +512,9 @@ async fn poll_tmux(
 
     state
         .pending_keyword_hits
+        .retain(|session, _| sessions.contains_key(session));
+    state
+        .session_last_heartbeat
         .retain(|session, _| sessions.contains_key(session));
 
     Ok(())
@@ -641,6 +732,199 @@ fn tmux_stale_event(
     .with_format(registration.format.clone())
 }
 
+fn tmux_content_changed_event(
+    registration: &RegisteredTmuxSession,
+    session: String,
+    pane: String,
+    content: SummarizedContent,
+) -> IncomingEvent {
+    IncomingEvent::tmux_content_changed_with_metadata(
+        session,
+        pane,
+        content.summary,
+        content.raw_truncated,
+        content.backend,
+        content.content_mode.as_str().to_string(),
+        registration.channel.clone(),
+    )
+    .with_mention(registration.mention.clone())
+    .with_format(registration.format.clone())
+}
+
+fn spawn_content_changed_task<E>(
+    emitter: E,
+    registration: RegisteredTmuxSession,
+    session_name: String,
+    pane_name: String,
+    content: String,
+) where
+    E: EventEmitter + Clone + Send + Sync + 'static,
+{
+    tokio::spawn(async move {
+        match build_summarizer(&registration.summarizer) {
+            Ok(summarizer) => match summarizer.summarize(&content, &session_name).await {
+                Ok(transformed) => {
+                    let event = tmux_content_changed_event(
+                        &registration,
+                        session_name,
+                        pane_name,
+                        transformed,
+                    );
+                    let _ = emitter.emit(event).await;
+                }
+                Err(error) => {
+                    eprintln!("clawhip: summarize failed for {session_name}: {error}");
+                }
+            },
+            Err(error) => {
+                eprintln!(
+                    "clawhip: could not initialize summarizer '{}' for {session_name}: {error}",
+                    registration.summarizer
+                );
+            }
+        }
+    });
+}
+
+fn tmux_waiting_for_input_event(
+    registration: &RegisteredTmuxSession,
+    session: String,
+    pane: String,
+    prompt_snapshot: String,
+) -> IncomingEvent {
+    IncomingEvent::tmux_waiting_for_input(
+        session,
+        pane,
+        prompt_snapshot,
+        registration.channel.clone(),
+    )
+    .with_mention(registration.mention.clone())
+    .with_format(registration.format.clone())
+}
+
+fn tmux_heartbeat_event(
+    registration: &RegisteredTmuxSession,
+    session: String,
+    minutes_since_change: u64,
+) -> IncomingEvent {
+    IncomingEvent::tmux_heartbeat(session, minutes_since_change, registration.channel.clone())
+        .with_mention(registration.mention.clone())
+        .with_format(registration.format.clone())
+}
+
+fn is_waiting_for_input(content: &str) -> Option<String> {
+    let patterns = [
+        "waiting for input",
+        "awaiting user input",
+        "press enter",
+        "hit enter",
+    ];
+    let last_10 = content.lines().rev().take(10).collect::<Vec<_>>();
+    let last_10_combined = last_10
+        .iter()
+        .rev()
+        .copied()
+        .collect::<Vec<_>>()
+        .join("\n")
+        .to_lowercase();
+    for pattern in &patterns {
+        if last_10_combined.contains(pattern) {
+            return Some(last_10.iter().rev().copied().collect::<Vec<_>>().join("\n"));
+        }
+    }
+    None
+}
+
+async fn maybe_emit_session_heartbeat<E: EventEmitter>(
+    session_name: &str,
+    registration: &RegisteredTmuxSession,
+    emitter: &E,
+    state: &mut TmuxMonitorState,
+    now: Instant,
+    session_changed: bool,
+) -> Result<()> {
+    if registration.heartbeat_mins == 0 {
+        state.session_last_heartbeat.remove(session_name);
+        return Ok(());
+    }
+
+    if session_changed {
+        state
+            .session_last_heartbeat
+            .insert(session_name.to_string(), now);
+    }
+
+    let interval = Duration::from_secs(registration.heartbeat_mins * 60);
+    let Some(last_change) = state
+        .panes
+        .values()
+        .filter(|pane| pane.session == session_name)
+        .map(|pane| pane.last_change)
+        .max()
+    else {
+        state
+            .session_last_heartbeat
+            .entry(session_name.to_string())
+            .or_insert(now);
+        return Ok(());
+    };
+
+    let last_heartbeat = state
+        .session_last_heartbeat
+        .entry(session_name.to_string())
+        .or_insert(now);
+    if now.duration_since(last_change) < interval || now.duration_since(*last_heartbeat) < interval
+    {
+        return Ok(());
+    }
+
+    emitter
+        .emit(tmux_heartbeat_event(
+            registration,
+            session_name.to_string(),
+            now.duration_since(last_change).as_secs() / 60,
+        ))
+        .await?;
+    *last_heartbeat = now;
+    Ok(())
+}
+
+async fn maybe_emit_registered_session_heartbeat<E: EventEmitter>(
+    registration: &RegisteredTmuxSession,
+    emitter: &E,
+    panes: &HashMap<String, TmuxPaneState>,
+    last_heartbeat: &mut Option<Instant>,
+    now: Instant,
+) -> Result<()> {
+    if registration.heartbeat_mins == 0 {
+        *last_heartbeat = None;
+        return Ok(());
+    }
+
+    let interval = Duration::from_secs(registration.heartbeat_mins * 60);
+    let Some(last_change) = panes.values().map(|pane| pane.last_change).max() else {
+        last_heartbeat.get_or_insert(now);
+        return Ok(());
+    };
+
+    let last_heartbeat_at = last_heartbeat.get_or_insert(now);
+    if now.duration_since(last_change) < interval
+        || now.duration_since(*last_heartbeat_at) < interval
+    {
+        return Ok(());
+    }
+
+    emitter
+        .emit(tmux_heartbeat_event(
+            registration,
+            registration.session.clone(),
+            now.duration_since(last_change).as_secs() / 60,
+        ))
+        .await?;
+    *last_heartbeat_at = now;
+    Ok(())
+}
+
 async fn flush_pending_keyword_hits<E: EventEmitter>(
     pending_keyword_hits: &mut Option<PendingKeywordHits>,
     registration: &RegisteredTmuxSession,
@@ -856,6 +1140,7 @@ mod tests {
             registration_source: RegistrationSource::ConfigMonitor,
             parent_process: None,
             active_wrapper_monitor: false,
+            ..Default::default()
         }
     }
 
@@ -950,6 +1235,7 @@ PR created #7",
             keyword_window_secs: 30,
             stale_minutes: 10,
             format: None,
+            ..Default::default()
         };
 
         let registration = RegisteredTmuxSession::from(&monitor);
@@ -979,6 +1265,7 @@ PR created #7",
                     registration_source: RegistrationSource::ConfigMonitor,
                     parent_process: None,
                     active_wrapper_monitor: false,
+                    ..Default::default()
                 },
             ),
             (
@@ -998,6 +1285,7 @@ PR created #7",
                         name: Some("codex".into()),
                     }),
                     active_wrapper_monitor: true,
+                    ..Default::default()
                 },
             ),
             (
@@ -1014,6 +1302,7 @@ PR created #7",
                     registration_source: RegistrationSource::ConfigMonitor,
                     parent_process: None,
                     active_wrapper_monitor: false,
+                    ..Default::default()
                 },
             ),
         ]);
@@ -1034,6 +1323,7 @@ PR created #7",
                     registration_source: RegistrationSource::ConfigMonitor,
                     parent_process: None,
                     active_wrapper_monitor: false,
+                    ..Default::default()
                 },
             )]),
         );
@@ -1338,6 +1628,7 @@ error: failed";
                 registration_source: RegistrationSource::ConfigMonitor,
                 parent_process: None,
                 active_wrapper_monitor: false,
+                ..Default::default()
             }],
             Some(&available_sessions),
         );
@@ -1367,6 +1658,7 @@ error: failed";
                     registration_source: RegistrationSource::ConfigMonitor,
                     parent_process: None,
                     active_wrapper_monitor: false,
+                    ..Default::default()
                 },
                 RegisteredTmuxSession {
                     session: "omx-*".into(),
@@ -1380,6 +1672,7 @@ error: failed";
                     registration_source: RegistrationSource::ConfigMonitor,
                     parent_process: None,
                     active_wrapper_monitor: false,
+                    ..Default::default()
                 },
             ],
             Some(&available_sessions),
@@ -1407,6 +1700,7 @@ error: failed";
                     registration_source: RegistrationSource::ConfigMonitor,
                     parent_process: None,
                     active_wrapper_monitor: false,
+                    ..Default::default()
                 },
                 RegisteredTmuxSession {
                     session: "rcc-*".into(),
@@ -1420,6 +1714,7 @@ error: failed";
                     registration_source: RegistrationSource::ConfigMonitor,
                     parent_process: None,
                     active_wrapper_monitor: false,
+                    ..Default::default()
                 },
             ],
             None,
@@ -1446,6 +1741,7 @@ error: failed";
                     registration_source: RegistrationSource::ConfigMonitor,
                     parent_process: None,
                     active_wrapper_monitor: false,
+                    ..Default::default()
                 },
                 RegisteredTmuxSession {
                     session: "rcc-api".into(),
@@ -1459,6 +1755,7 @@ error: failed";
                     registration_source: RegistrationSource::ConfigMonitor,
                     parent_process: None,
                     active_wrapper_monitor: false,
+                    ..Default::default()
                 },
             ],
             Some(&available_sessions),
@@ -1485,6 +1782,7 @@ error: failed";
                     registration_source: RegistrationSource::ConfigMonitor,
                     parent_process: None,
                     active_wrapper_monitor: false,
+                    ..Default::default()
                 },
                 RegisteredTmuxSession {
                     session: "rcc-*".into(),
@@ -1498,6 +1796,7 @@ error: failed";
                     registration_source: RegistrationSource::ConfigMonitor,
                     parent_process: None,
                     active_wrapper_monitor: false,
+                    ..Default::default()
                 },
             ],
             Some(&available_sessions),
@@ -1529,6 +1828,7 @@ error: failed";
                     registration_source: RegistrationSource::ConfigMonitor,
                     parent_process: None,
                     active_wrapper_monitor: false,
+                    ..Default::default()
                 },
                 RegisteredTmuxSession {
                     session: "abc*".into(),
@@ -1542,6 +1842,7 @@ error: failed";
                     registration_source: RegistrationSource::ConfigMonitor,
                     parent_process: None,
                     active_wrapper_monitor: false,
+                    ..Default::default()
                 },
             ],
             Some(&available_sessions),

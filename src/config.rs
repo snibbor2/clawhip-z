@@ -285,6 +285,15 @@ pub struct TmuxSessionMonitor {
     pub channel: Option<String>,
     pub mention: Option<String>,
     pub format: Option<MessageFormat>,
+    // ── Optional tmux content transformation ──
+    #[serde(default)]
+    pub summarize: bool,
+    #[serde(default = "default_summarizer")]
+    pub summarizer: String,
+    #[serde(default)]
+    pub heartbeat_mins: u64,
+    #[serde(default)]
+    pub detect_waiting: bool,
 }
 
 impl Default for TmuxSessionMonitor {
@@ -297,6 +306,10 @@ impl Default for TmuxSessionMonitor {
             channel: None,
             mention: None,
             format: None,
+            summarize: false,
+            summarizer: default_summarizer(),
+            heartbeat_mins: 0,
+            detect_waiting: false,
         }
     }
 }
@@ -424,6 +437,10 @@ fn default_cron_timezone() -> String {
 }
 fn default_true() -> bool {
     true
+}
+
+fn default_summarizer() -> String {
+    "gemini:gemini-2.5-flash".to_string()
 }
 
 pub fn default_sink_name() -> String {

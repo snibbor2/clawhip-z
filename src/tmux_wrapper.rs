@@ -109,6 +109,10 @@ impl From<TmuxMonitorArgs> for RegisteredTmuxSession {
             registration_source: value.registration_source,
             parent_process: value.parent_process,
             active_wrapper_monitor: true,
+            summarize: false,
+            summarizer: String::new(),
+            heartbeat_mins: 0,
+            detect_waiting: false,
         }
     }
 }
@@ -523,6 +527,10 @@ mod tests {
                 name: Some("codex".into()),
             }),
             active_wrapper_monitor: true,
+            summarize: false,
+            summarizer: String::new(),
+            heartbeat_mins: 0,
+            detect_waiting: false,
         });
 
         assert!(log.contains("session=issue-105"));
