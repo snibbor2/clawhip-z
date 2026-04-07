@@ -294,6 +294,12 @@ pub struct TmuxSessionMonitor {
     pub heartbeat_mins: u64,
     #[serde(default)]
     pub detect_waiting: bool,
+    /// Minimum number of new lines added before triggering summarization. 0 = no filter.
+    #[serde(default)]
+    pub min_new_lines: usize,
+    /// Minimum minutes between LLM summarization calls for this session. 0 = no throttle.
+    #[serde(default)]
+    pub summarize_interval_mins: u64,
 }
 
 impl Default for TmuxSessionMonitor {
@@ -310,6 +316,8 @@ impl Default for TmuxSessionMonitor {
             summarizer: default_summarizer(),
             heartbeat_mins: 0,
             detect_waiting: false,
+            min_new_lines: 0,
+            summarize_interval_mins: 0,
         }
     }
 }

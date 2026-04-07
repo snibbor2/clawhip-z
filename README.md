@@ -631,6 +631,82 @@ Verification:
 - emit keyword in pane
 - confirm Discord message body and mention
 
+### 13. tmux snapshot summarization preset
+
+Input:
+- built-in config monitor with `summarize = true` on a `[[monitors.tmux.sessions]]` entry
+
+Behavior:
+- on pane content change, spawn a non-blocking background task (does NOT stall the poll loop)
+- call the configured summarizer backend
+- emit `tmux.content_changed` with `content_mode = "raw"` or `"summary"` depending on backend
+- `raw` mode: edits a single living Discord message per session with the latest terminal output
+- `summary` mode: posts a new Discord message per AI summary (historical record)
+- `tmux.heartbeat`: edits the same Discord message per session while session is idle
+- `tmux.waiting_for_input`: edits the same Discord message per session while waiting for user input
+
+Verification:
+- generate ≥ `min_new_lines` new lines in the monitored session
+- confirm `📋` (raw) or `🤖` (AI summary) message in target channel
+- confirm heartbeat `💓` message updates in-place after idle interval
+- confirm `⏳` waiting message updates in-place when session blocks on input
+
+#### Session config reference
+
+```toml
+[[monitors.tmux.sessions]]
+session = "my-session"
+channel = "YOUR_CHANNEL_ID"
+
+# ── Summarization ─────────────────────────────────────────────────────────────
+summarize = true                        # enable snapshot summarization
+summarizer = "gemini:gemini-2.5-flash"  # see backend options below
+summarize_interval_mins = 5             # min minutes between LLM calls (0 = no throttle)
+min_new_lines = 3                       # min net new lines before triggering (0 = no filter)
+
+# ── Input detection ───────────────────────────────────────────────────────────
+detect_waiting = true    # emit tmux.waiting_for_input when session blocks on input
+
+# ── Heartbeat ─────────────────────────────────────────────────────────────────
+heartbeat_mins = 5       # emit tmux.heartbeat after this many idle minutes (0 = disabled)
+
+# ── Keywords (real-time, always fires regardless of summarize settings) ────────
+keywords = ["error", "complete", "done", "fail"]
+keyword_window_secs = 30  # debounce window; deduplicates across flushes
+```
+
+#### Summarizer backends
+
+| Config value | Description | Requires |
+|---|---|---|
+| `raw` | Passes latest terminal output directly (no LLM) | nothing |
+| `gemini` / `gemini:<model>` | Gemini CLI subprocess | `gemini` CLI in PATH |
+| `openrouter:<model>` | OpenRouter API | `OPENROUTER_API_KEY` env var |
+| `openai:<model>` | OpenAI or any OpenAI-compatible endpoint | `OPENAI_API_KEY` env var |
+| `openai-compatible:<model>` | Same as `openai:` | `OPENAI_API_KEY` env var |
+
+For non-OpenRouter OpenAI-compatible endpoints (xAI Grok, Together AI, Ollama, etc.), set `OPENAI_BASE_URL` before starting the daemon:
+
+```bash
+export OPENAI_BASE_URL="https://api.x.ai/v1"
+export OPENAI_API_KEY="your-key"
+# config: summarizer = "openai:grok-3"
+```
+
+Default models when no model is specified: Gemini → `gemini-2.5-flash`, OpenRouter → `openai/gpt-4o-mini`, OpenAI → `gpt-4o-mini`.
+
+#### Discord delivery behavior
+
+| Event | Discord behavior | Key |
+|---|---|---|
+| `tmux.content_changed` (raw) | **Edit in-place** | one message per session |
+| `tmux.content_changed` (AI summary) | **New message** | historical record |
+| `tmux.heartbeat` | **Edit in-place** | one message per session |
+| `tmux.waiting_for_input` | **Edit in-place** | one message per session |
+| `tmux.keyword` | **New message** | real-time, deduped across windows |
+
+Keywords fire in real-time regardless of `summarize_interval_mins`. The same `(keyword, line)` pair is never repeated across consecutive keyword messages.
+
 ### 12. install lifecycle preset
 
 Input:
@@ -687,6 +763,9 @@ Verification:
 ### tmux family
 - `tmux.keyword`
 - `tmux.stale`
+- `tmux.content_changed` — pane content changed; carries `content_mode: "raw" | "summary"`
+- `tmux.heartbeat` — session idle for configured interval; **edits** the previous heartbeat message in-place
+- `tmux.waiting_for_input` — session is blocking on user input; **edits** previous waiting message in-place
 
 ## Route contract
 

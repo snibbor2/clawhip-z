@@ -751,7 +751,13 @@ fn render_aggregated_tmux_keyword(
     let hit_count = optional_u64_field(payload, "hit_count")
         .map(|count| count as usize)
         .unwrap_or(hits.len());
-    let summaries = hits
+    const MAX_HITS_SHOWN: usize = 10;
+    let visible_hits = if hits.len() > MAX_HITS_SHOWN {
+        &hits[hits.len() - MAX_HITS_SHOWN..]
+    } else {
+        hits.as_slice()
+    };
+    let summaries = visible_hits
         .iter()
         .filter_map(|hit| {
             let keyword = hit.get("keyword").and_then(Value::as_str)?.trim();

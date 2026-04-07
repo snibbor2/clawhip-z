@@ -34,6 +34,9 @@ struct DiscordState {
     limiter: RateLimiter,
     circuits: HashMap<String, CircuitBreaker>,
     dlq: Dlq,
+    /// Tracks the last Discord message ID sent for each heartbeat session+channel.
+    /// Key: "{channel_id}:{session}". Used to edit instead of post new messages.
+    last_heartbeat_msg_ids: HashMap<String, String>,
 }
 
 #[derive(Debug)]
@@ -77,6 +80,7 @@ impl DiscordClient {
                 limiter: RateLimiter::new(RATE_LIMIT_CAPACITY, RATE_LIMIT_REFILL_PER_SEC),
                 circuits: HashMap::new(),
                 dlq: Dlq::default(),
+                last_heartbeat_msg_ids: HashMap::new(),
             })),
         })
     }
@@ -97,7 +101,23 @@ impl DiscordClient {
 
             let result = match target {
                 SinkTarget::DiscordChannel(channel_id) => {
-                    self.send_message(channel_id, &message.content).await
+                    let session = message.payload["session"].as_str().unwrap_or("unknown");
+                    let edit_key = match message.event_kind.as_str() {
+                        "tmux.heartbeat" => Some(format!("heartbeat:{session}")),
+                        "tmux.waiting_for_input" => Some(format!("waiting:{session}")),
+                        "tmux.content_changed"
+                            if message.payload["content_mode"].as_str() == Some("raw") =>
+                        {
+                            Some(format!("raw:{session}"))
+                        }
+                        _ => None,
+                    };
+                    if let Some(key) = edit_key {
+                        self.send_or_edit_keyed(channel_id, &key, &message.content)
+                            .await
+                    } else {
+                        self.send_message(channel_id, &message.content).await
+                    }
                 }
                 SinkTarget::DiscordWebhook(webhook_url) => {
                     self.send_webhook(webhook_url, &message.content).await
@@ -148,10 +168,89 @@ impl DiscordClient {
         })?;
 
         self.execute_request(
-            client.post(url).json(&json!({ "content": content })),
+            client.post(url).json(&json!({ "content": truncate_discord(content) })),
             "Discord API request",
         )
         .await
+    }
+
+    /// Send a message and return the Discord message ID on success.
+    async fn send_message_returning_id(
+        &self,
+        channel_id: &str,
+        content: &str,
+    ) -> std::result::Result<Option<String>, DiscordSendError> {
+        let url = format!(
+            "{}/channels/{}/messages",
+            self.api_base.trim_end_matches('/'),
+            channel_id
+        );
+        let client = self.bot_client.as_ref().ok_or_else(|| DiscordSendError {
+            message: "missing Discord bot token for channel delivery".to_string(),
+            retry_after: None,
+        })?;
+        self.execute_request_returning_id(
+            client.post(url).json(&json!({ "content": truncate_discord(content) })),
+            "Discord API request",
+        )
+        .await
+    }
+
+    /// Edit an existing Discord message.
+    async fn edit_message(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        content: &str,
+    ) -> std::result::Result<(), DiscordSendError> {
+        let url = format!(
+            "{}/channels/{}/messages/{}",
+            self.api_base.trim_end_matches('/'),
+            channel_id,
+            message_id
+        );
+        let client = self.bot_client.as_ref().ok_or_else(|| DiscordSendError {
+            message: "missing Discord bot token for channel delivery".to_string(),
+            retry_after: None,
+        })?;
+        self.execute_request(
+            client.patch(url).json(&json!({ "content": truncate_discord(content) })),
+            "Discord edit request",
+        )
+        .await
+    }
+
+    /// For edit-in-place event types (heartbeat, raw, waiting): edit the previous
+    /// message for this key if possible, otherwise post a new one and store the ID.
+    /// `edit_key` is a logical key like "heartbeat:session-name" or "raw:session-name".
+    async fn send_or_edit_keyed(
+        &self,
+        channel_id: &str,
+        edit_key: &str,
+        content: &str,
+    ) -> std::result::Result<(), DiscordSendError> {
+        let key = format!("{channel_id}:{edit_key}");
+        let existing_id = {
+            let state = self.state.lock().expect("discord state lock");
+            state.last_heartbeat_msg_ids.get(&key).cloned()
+        };
+
+        if let Some(msg_id) = existing_id {
+            match self.edit_message(channel_id, &msg_id, content).await {
+                Ok(()) => return Ok(()),
+                Err(e) if e.message.contains("404") || e.message.contains("Unknown Message") => {
+                    // Message was deleted; fall through to create a new one
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        let msg_id = self.send_message_returning_id(channel_id, content).await?;
+        if let Some(id) = msg_id {
+            let mut state = self.state.lock().expect("discord state lock");
+            state.last_heartbeat_msg_ids.insert(key, id);
+        }
+        Ok(())
     }
 
     async fn send_webhook(
@@ -162,10 +261,36 @@ impl DiscordClient {
         self.execute_request(
             self.webhook_client
                 .post(webhook_url_with_wait(webhook_url))
-                .json(&json!({ "content": content })),
+                .json(&json!({ "content": truncate_discord(content) })),
             "Discord webhook request",
         )
         .await
+    }
+
+    async fn execute_request_returning_id(
+        &self,
+        request: reqwest::RequestBuilder,
+        label: &str,
+    ) -> std::result::Result<Option<String>, DiscordSendError> {
+        let response = request.send().await.map_err(|error| DiscordSendError {
+            message: format!("{label} failed: {error}"),
+            retry_after: None,
+        })?;
+
+        if response.status().is_success() {
+            let body = response
+                .json::<serde_json::Value>()
+                .await
+                .ok();
+            return Ok(body.and_then(|v| v["id"].as_str().map(str::to_string)));
+        }
+
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        Err(DiscordSendError {
+            message: format!("{label} failed with {status}: {body}"),
+            retry_after: parse_retry_after(status, &body),
+        })
     }
 
     async fn execute_request(
@@ -291,6 +416,20 @@ fn target_rate_limit_key(target: &SinkTarget) -> String {
 
 fn jitter_for_attempt(attempt: u32) -> Duration {
     Duration::from_millis(JITTER_MS * u64::from(attempt))
+}
+
+/// Truncate content to Discord's 2000-char message limit, appending "…" if clipped.
+fn truncate_discord(content: &str) -> &str {
+    const LIMIT: usize = 1990;
+    if content.len() <= LIMIT {
+        return content;
+    }
+    // Walk back to a char boundary
+    let mut end = LIMIT;
+    while !content.is_char_boundary(end) {
+        end -= 1;
+    }
+    &content[..end]
 }
 
 fn webhook_url_with_wait(webhook_url: &str) -> String {

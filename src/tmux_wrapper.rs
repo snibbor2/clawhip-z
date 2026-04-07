@@ -113,6 +113,8 @@ impl From<TmuxMonitorArgs> for RegisteredTmuxSession {
             summarizer: String::new(),
             heartbeat_mins: 0,
             detect_waiting: false,
+            min_new_lines: 0,
+            summarize_interval_mins: 0,
         }
     }
 }
@@ -531,6 +533,8 @@ mod tests {
             summarizer: String::new(),
             heartbeat_mins: 0,
             detect_waiting: false,
+            min_new_lines: 0,
+            summarize_interval_mins: 0,
         });
 
         assert!(log.contains("session=issue-105"));

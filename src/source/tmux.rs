@@ -72,6 +72,10 @@ pub struct RegisteredTmuxSession {
     pub heartbeat_mins: u64,
     #[serde(default)]
     pub detect_waiting: bool,
+    #[serde(default)]
+    pub min_new_lines: usize,
+    #[serde(default)]
+    pub summarize_interval_mins: u64,
 }
 
 impl From<&TmuxSessionMonitor> for RegisteredTmuxSession {
@@ -92,6 +96,8 @@ impl From<&TmuxSessionMonitor> for RegisteredTmuxSession {
             summarizer: value.summarizer.clone(),
             heartbeat_mins: value.heartbeat_mins,
             detect_waiting: value.detect_waiting,
+            min_new_lines: value.min_new_lines,
+            summarize_interval_mins: value.summarize_interval_mins,
         }
     }
 }
@@ -161,6 +167,7 @@ struct TmuxMonitorState {
     panes: HashMap<String, TmuxPaneState>,
     pending_keyword_hits: HashMap<String, PendingKeywordHits>,
     session_last_heartbeat: HashMap<String, Instant>,
+    session_last_summarized: HashMap<String, Instant>,
 }
 
 struct TmuxPaneSnapshot {
@@ -177,6 +184,7 @@ pub async fn monitor_registered_session(
     let mut panes = HashMap::new();
     let mut pending_keyword_hits = None;
     let mut last_heartbeat = None;
+    let mut last_summarized: Option<Instant> = None;
     let poll_interval = Duration::from_secs(1);
 
     loop {
@@ -239,7 +247,16 @@ pub async fn monitor_registered_session(
                         );
                         push_pending_keyword_hits(&mut pending_keyword_hits, now, hits);
 
-                        if registration.summarize {
+                        if registration.summarize
+                            && should_summarize_now(
+                                last_summarized,
+                                registration.summarize_interval_mins,
+                                registration.min_new_lines,
+                                &existing.snapshot,
+                                &pane.content,
+                                now,
+                            )
+                        {
                             spawn_content_changed_task(
                                 client.clone(),
                                 registration.clone(),
@@ -247,6 +264,7 @@ pub async fn monitor_registered_session(
                                 pane.pane_name.clone(),
                                 pane.content.clone(),
                             );
+                            last_summarized = Some(now);
                         }
 
                         if registration.detect_waiting
@@ -429,7 +447,16 @@ async fn poll_tmux(
                                     &pane.content,
                                     &registration.keywords,
                                 );
-                                if registration.summarize {
+                                if registration.summarize
+                                    && should_summarize_now(
+                                        state.session_last_summarized.get(session_name).copied(),
+                                        registration.summarize_interval_mins,
+                                        registration.min_new_lines,
+                                        &existing.snapshot,
+                                        &pane.content,
+                                        now,
+                                    )
+                                {
                                     spawn_content_changed_task(
                                         tx.clone(),
                                         registration.clone(),
@@ -437,6 +464,9 @@ async fn poll_tmux(
                                         pane.pane_name.clone(),
                                         pane.content.clone(),
                                     );
+                                    state
+                                        .session_last_summarized
+                                        .insert(session_name.to_string(), now);
                                 }
                                 if registration.detect_waiting
                                     && let Some(prompt) = is_waiting_for_input(&pane.content)
@@ -515,6 +545,9 @@ async fn poll_tmux(
         .retain(|session, _| sessions.contains_key(session));
     state
         .session_last_heartbeat
+        .retain(|session, _| sessions.contains_key(session));
+    state
+        .session_last_summarized
         .retain(|session, _| sessions.contains_key(session));
 
     Ok(())
@@ -812,6 +845,29 @@ fn tmux_heartbeat_event(
         .with_format(registration.format.clone())
 }
 
+fn count_new_lines(old: &str, new: &str) -> usize {
+    new.lines().count().saturating_sub(old.lines().count())
+}
+
+fn should_summarize_now(
+    last_summarized: Option<Instant>,
+    interval_mins: u64,
+    min_new_lines: usize,
+    old_content: &str,
+    new_content: &str,
+    now: Instant,
+) -> bool {
+    if min_new_lines > 0 && count_new_lines(old_content, new_content) < min_new_lines {
+        return false;
+    }
+    if interval_mins == 0 {
+        return true;
+    }
+    last_summarized
+        .map(|t| now.duration_since(t) >= Duration::from_secs(interval_mins * 60))
+        .unwrap_or(true)
+}
+
 fn is_waiting_for_input(content: &str) -> Option<String> {
     let patterns = [
         "waiting for input",
@@ -945,11 +1001,21 @@ async fn flush_pending_keyword_hits<E: EventEmitter>(
     let Some(pending) = pending_keyword_hits.take() else {
         return Ok(());
     };
-    let hits = pending
-        .into_hits()
+    let (raw_hits, next_window) = if force {
+        (pending.into_hits(), None)
+    } else {
+        let (hits, reset) = pending.flush_and_reset(now);
+        (hits, Some(reset))
+    };
+    let hits = raw_hits
         .into_iter()
         .map(|hit| (hit.keyword, hit.line))
         .collect::<Vec<_>>();
+    // Restore the reset window (with seen carried forward) before emitting so
+    // new hits arriving during the await are not lost.
+    if let Some(w) = next_window {
+        *pending_keyword_hits = Some(w);
+    }
     if hits.is_empty() {
         return Ok(());
     }
@@ -1126,6 +1192,58 @@ mod tests {
     use super::*;
     use crate::event::{EventBody, compat::from_incoming_event};
     use crate::keyword_window::KeywordHit;
+
+    #[test]
+    fn count_new_lines_returns_net_addition() {
+        assert_eq!(count_new_lines("a\nb\n", "a\nb\nc\nd\n"), 2);
+    }
+
+    #[test]
+    fn count_new_lines_no_change_returns_zero() {
+        assert_eq!(count_new_lines("a\nb\n", "a\nb\n"), 0);
+    }
+
+    #[test]
+    fn count_new_lines_fewer_lines_returns_zero() {
+        assert_eq!(count_new_lines("a\nb\nc\n", "a\n"), 0);
+    }
+
+    #[test]
+    fn should_summarize_now_no_filter_no_throttle() {
+        assert!(should_summarize_now(None, 0, 0, "old", "new", Instant::now()));
+    }
+
+    #[test]
+    fn should_summarize_now_min_new_lines_blocks_when_insufficient() {
+        assert!(!should_summarize_now(None, 0, 5, "a\nb\n", "a\nb\nc\n", Instant::now()));
+    }
+
+    #[test]
+    fn should_summarize_now_min_new_lines_allows_when_met() {
+        let old = "a\n".repeat(10);
+        let new = format!("{}{}", old, "b\n".repeat(5));
+        assert!(should_summarize_now(None, 0, 5, &old, &new, Instant::now()));
+    }
+
+    #[test]
+    fn should_summarize_now_interval_blocks_when_too_soon() {
+        let now = Instant::now();
+        let recent = now - Duration::from_secs(30);
+        // interval_mins=5 but only 30 seconds elapsed
+        assert!(!should_summarize_now(Some(recent), 5, 0, "old", "new", now));
+    }
+
+    #[test]
+    fn should_summarize_now_interval_allows_when_expired() {
+        let now = Instant::now();
+        let old_enough = now - Duration::from_secs(6 * 60);
+        assert!(should_summarize_now(Some(old_enough), 5, 0, "old", "new", now));
+    }
+
+    #[test]
+    fn should_summarize_now_no_prior_summarize_always_allowed_with_throttle() {
+        assert!(should_summarize_now(None, 5, 0, "old", "new", Instant::now()));
+    }
 
     fn registration(keywords: Vec<&str>) -> RegisteredTmuxSession {
         RegisteredTmuxSession {
