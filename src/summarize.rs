@@ -109,16 +109,19 @@ pub fn build_summarizer(
 ) -> Result<Box<dyn Summarizer>, Box<dyn Error + Send + Sync>> {
     match parse_summarizer_spec(summarizer)? {
         SummarizerSpec::Gemini { model } => Ok(Box::new(GeminiCli { model })),
-        SummarizerSpec::OpenRouter { model } => Ok(Box::new(
-            OpenAiCompatibleSummarizer::new_openrouter(model, providers.openrouter.api_key.as_deref())?,
-        )),
-        SummarizerSpec::OpenAiCompatible { model } => Ok(Box::new(
-            OpenAiCompatibleSummarizer::new_openai_compatible(
+        SummarizerSpec::OpenRouter { model } => {
+            Ok(Box::new(OpenAiCompatibleSummarizer::new_openrouter(
+                model,
+                providers.openrouter.api_key.as_deref(),
+            )?))
+        }
+        SummarizerSpec::OpenAiCompatible { model } => {
+            Ok(Box::new(OpenAiCompatibleSummarizer::new_openai_compatible(
                 model,
                 providers.openai.api_key.as_deref(),
                 providers.openai.base_url.as_deref(),
-            )?,
-        )),
+            )?))
+        }
         SummarizerSpec::Raw => Ok(Box::new(RawPassthroughSummarizer)),
     }
 }
@@ -321,7 +324,12 @@ impl OpenAiCompatibleSummarizer {
         config_key: Option<&str>,
     ) -> Result<Self, Box<dyn Error + Send + Sync>> {
         let api_key = resolve_key(config_key, "OPENROUTER_API_KEY", "openrouter")?;
-        Self::new("openrouter", OPENROUTER_BASE_URL.to_string(), api_key, model)
+        Self::new(
+            "openrouter",
+            OPENROUTER_BASE_URL.to_string(),
+            api_key,
+            model,
+        )
     }
 
     fn new_openai_compatible(
@@ -332,7 +340,11 @@ impl OpenAiCompatibleSummarizer {
         let base_url = config_base_url
             .filter(|v| !v.trim().is_empty())
             .map(str::to_string)
-            .or_else(|| std::env::var("OPENAI_BASE_URL").ok().filter(|v| !v.trim().is_empty()))
+            .or_else(|| {
+                std::env::var("OPENAI_BASE_URL")
+                    .ok()
+                    .filter(|v| !v.trim().is_empty())
+            })
             .unwrap_or_else(|| DEFAULT_OPENAI_BASE_URL.to_string());
         let api_key = resolve_key(config_key, "OPENAI_API_KEY", "openai")?;
         Self::new("openai-compatible", base_url, api_key, model)
