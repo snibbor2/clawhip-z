@@ -22,6 +22,7 @@ mod router;
 mod sink;
 mod slack;
 mod source;
+mod summarize;
 mod tmux_wrapper;
 mod update;
 
@@ -414,6 +415,7 @@ mod tests {
                 name: Some("codex".into()),
             }),
             active_wrapper_monitor: true,
+            ..Default::default()
         }]);
 
         assert!(output.contains(
