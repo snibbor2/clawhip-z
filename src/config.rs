@@ -328,6 +328,15 @@ pub struct TmuxSessionMonitor {
     /// Minimum minutes between AI summary events. 0 = use summarize_interval_mins.
     #[serde(default)]
     pub summary_interval: u64,
+    #[serde(default)]
+    pub detect_waiting: bool,
+    /// Cooldown minutes between waiting-for-input alerts. 0 = no cooldown.
+    #[serde(default)]
+    pub waiting_interval: u64,
+    /// Event kinds that trigger the @mention. Empty = mention applies to all events.
+    /// Valid values: "keyword", "waiting_for_input", "content_changed", "stale", "heartbeat".
+    #[serde(default)]
+    pub mention_on: Vec<String>,
 }
 
 impl Default for TmuxSessionMonitor {
@@ -347,6 +356,9 @@ impl Default for TmuxSessionMonitor {
             summarize_interval_mins: 0,
             heartbeat_interval: 0,
             summary_interval: 0,
+            detect_waiting: false,
+            waiting_interval: 0,
+            mention_on: Vec::new(),
         }
     }
 }
