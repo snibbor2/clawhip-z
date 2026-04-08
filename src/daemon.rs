@@ -598,7 +598,10 @@ mod tests {
         let queued = rx.recv().await.unwrap();
         assert_eq!(queued.kind, "session.started");
         assert_eq!(queued.payload["tool"], Value::from("codex"));
-        assert_eq!(queued.payload["session_id"], Value::from("sess-65"));
+        assert_eq!(
+            queued.payload["session_id"],
+            Value::from("issue-65-native-sdk")
+        );
         assert_eq!(queued.payload["event_id"], Value::from(event_id));
     }
 

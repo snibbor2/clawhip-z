@@ -7,7 +7,6 @@ use serde_json::{Map, Value, json};
 use crate::Result;
 use crate::cli::NativeInstallArgs;
 
-const CLAWHIP_DIR: &str = ".clawhip";
 const PROJECT_METADATA: &str = ".clawhip/project.json";
 const HOOK_SCRIPT: &str = ".clawhip/hooks/native-hook.mjs";
 const AUGMENT_SCRIPT: &str = ".clawhip/hooks/augment.mjs";
@@ -107,7 +106,10 @@ pub fn install_with_paths(
 
     if args.provider.installs_claude() {
         let path = root.join(CLAUDE_SETTINGS);
-        write_claude_settings(&path, provider_command(&root, scope, NativeProvider::Claude))?;
+        write_claude_settings(
+            &path,
+            provider_command(&root, scope, NativeProvider::Claude),
+        )?;
         report.claude_settings = Some(path);
     }
 
@@ -115,7 +117,10 @@ pub fn install_with_paths(
         let config_path = root.join(CODEX_CONFIG);
         let hooks_path = root.join(CODEX_HOOKS);
         write_codex_config(&config_path)?;
-        write_codex_hooks(&hooks_path, provider_command(&root, scope, NativeProvider::Codex))?;
+        write_codex_hooks(
+            &hooks_path,
+            provider_command(&root, scope, NativeProvider::Codex),
+        )?;
         report.codex_config = Some(config_path);
         report.codex_hooks = Some(hooks_path);
     }
@@ -230,11 +235,7 @@ pub fn incoming_event_from_native_hook_json(
     });
     let repo_name = first_string(
         payload,
-        &[
-            "/repo_name",
-            "/context/repo_name",
-            "/payload/repo_name",
-        ],
+        &["/repo_name", "/context/repo_name", "/payload/repo_name"],
     )
     .or_else(|| metadata.as_ref().and_then(repo_name_from_metadata))
     .or_else(|| project.clone());
@@ -273,8 +274,8 @@ pub fn incoming_event_from_native_hook_json(
     );
     let prompt = first_string(payload, &["/prompt", "/payload/prompt"]);
     let model = first_string(payload, &["/model", "/payload/model"]);
-    let session_source = first_string(payload, &["/payload/source", "/source"])
-        .filter(|value| value != &provider);
+    let session_source =
+        first_string(payload, &["/payload/source", "/source"]).filter(|value| value != &provider);
 
     let event_payload = payload
         .get("event_payload")
@@ -379,13 +380,6 @@ pub fn incoming_event_from_native_hook_json(
         template: None,
         payload: Value::Object(normalized),
     })
-}
-
-pub fn native_hooks_installed(workdir: &Path) -> bool {
-    workdir.join(PROJECT_METADATA).is_file()
-        || workdir.join(CLAUDE_SETTINGS).is_file()
-        || workdir.join(CODEX_CONFIG).is_file()
-        || workdir.join(CODEX_HOOKS).is_file()
 }
 
 fn install_root(args: &NativeInstallArgs, home_override: Option<&Path>) -> Result<PathBuf> {
@@ -505,11 +499,7 @@ fn ensure_command_hook(
 
 fn ensure_command_hook_array(groups: &mut Vec<Value>, command: &str, matcher: Option<&str>) {
     let already_present = groups.iter().any(|group| {
-        group
-            .get("matcher")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            == matcher
+        group.get("matcher").and_then(Value::as_str).map(str::trim) == matcher
             && group
                 .get("hooks")
                 .and_then(Value::as_array)
@@ -567,7 +557,12 @@ fn ensure_object<'a>(object: &'a mut Map<String, Value>, key: &str) -> &'a mut M
 }
 
 fn normalize_provider(provider: Option<&str>) -> String {
-    match provider.unwrap_or("unknown").trim().to_ascii_lowercase().as_str() {
+    match provider
+        .unwrap_or("unknown")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "claude-code" | "claude" => "claude".to_string(),
         "codex" => "codex".to_string(),
         other if !other.is_empty() => other.to_string(),
@@ -576,11 +571,17 @@ fn normalize_provider(provider: Option<&str>) -> String {
 }
 
 fn project_name_from_metadata(value: &Value) -> Option<String> {
-    first_string(value, &["/project", "/project_name", "/name", "/slug", "/id"])
+    first_string(
+        value,
+        &["/project", "/project_name", "/name", "/slug", "/id"],
+    )
 }
 
 fn repo_name_from_metadata(value: &Value) -> Option<String> {
-    first_string(value, &["/repo_name", "/repo", "/project", "/name", "/slug"])
+    first_string(
+        value,
+        &["/repo_name", "/repo", "/project", "/name", "/slug"],
+    )
 }
 
 fn load_project_metadata_from_dir(directory: &Path) -> Option<Value> {
@@ -600,7 +601,12 @@ fn load_project_metadata_from_dir(directory: &Path) -> Option<Value> {
 }
 
 fn map_common_event(value: &str) -> Option<&'static str> {
-    match value.trim().replace(['_', '.'], "-").to_ascii_lowercase().as_str() {
+    match value
+        .trim()
+        .replace(['_', '.'], "-")
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "sessionstart" | "session-start" | "started" => Some("session.started"),
         "pretooluse" | "pre-tool-use" => Some("session.pre-tool-use"),
         "posttooluse" | "post-tool-use" => Some("session.post-tool-use"),
@@ -937,7 +943,10 @@ mod tests {
 
         assert_eq!(event.payload["project"], json!("realign-hooks"));
         assert_eq!(event.payload["repo_name"], json!("clawhip"));
-        assert_eq!(event.payload["project_identity"]["project"], json!("realign-hooks"));
+        assert_eq!(
+            event.payload["project_identity"]["project"],
+            json!("realign-hooks")
+        );
     }
 
     #[test]
@@ -991,9 +1000,11 @@ mod tests {
                 .unwrap();
         assert!(codex_hooks["hooks"]["SessionStart"].is_array());
         assert!(codex_hooks["hooks"]["Stop"].is_array());
-        assert!(fs::read_to_string(dir.path().join(CODEX_CONFIG))
-            .unwrap()
-            .contains("codex_hooks = true"));
+        assert!(
+            fs::read_to_string(dir.path().join(CODEX_CONFIG))
+                .unwrap()
+                .contains("codex_hooks = true")
+        );
     }
 
     #[test]
