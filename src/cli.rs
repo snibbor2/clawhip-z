@@ -880,24 +880,6 @@ mod tests {
     }
 
     #[test]
-    fn parses_omx_hook_subcommand() {
-        let cli = Cli::parse_from(["clawhip", "omx", "hook", "--file", "payload.json"]);
-
-        let Commands::Omx { command } = cli.command.expect("omx command") else {
-            panic!("expected omx command");
-        };
-
-        let OmxCommands::Hook(args) = command else {
-            panic!("expected omx hook command");
-        };
-
-        assert_eq!(
-            args.file.as_deref(),
-            Some(PathBuf::from("payload.json").as_path())
-        );
-    }
-
-    #[test]
     fn parses_cron_run_subcommand() {
         let cli = Cli::parse_from(["clawhip", "cron", "run", "dev-followup"]);
 
@@ -910,30 +892,54 @@ mod tests {
     }
 
     #[test]
-    fn omx_hook_args_read_payload_from_inline_json() {
-        let args = OmxHookArgs {
-            payload: Some(
-                r#"{"schema_version":"1","context":{"normalized_event":"started"}}"#.into(),
-            ),
+    fn parses_native_install_subcommand() {
+        let cli = Cli::parse_from([
+            "clawhip",
+            "native",
+            "install",
+            "--provider",
+            "claude",
+            "--scope",
+            "global",
+        ]);
+
+        let Commands::Native { command } = cli.command.expect("native command") else {
+            panic!("expected native command");
+        };
+
+        let NativeCommands::Install(args) = command else {
+            panic!("expected native install command");
+        };
+
+        assert_eq!(args.provider, crate::native_hooks::NativeProvider::Claude);
+        assert_eq!(args.scope, crate::native_hooks::NativeInstallScope::Global);
+        assert_eq!(args.root, None);
+    }
+
+    #[test]
+    fn native_hook_args_read_payload_from_inline_json() {
+        let args = NativeHookArgs {
+            payload: Some(r#"{"event_name":"SessionStart","provider":"codex"}"#.into()),
             file: None,
+            provider: None,
+            source: None,
         };
 
         let payload = args
             .read_payload(&mut std::io::Cursor::new(Vec::<u8>::new()))
             .expect("inline json payload");
 
-        assert_eq!(payload["schema_version"], serde_json::json!("1"));
-        assert_eq!(
-            payload["context"]["normalized_event"],
-            serde_json::json!("started")
-        );
+        assert_eq!(payload["event_name"], serde_json::json!("SessionStart"));
+        assert_eq!(payload["provider"], serde_json::json!("codex"));
     }
 
     #[test]
-    fn omx_hook_args_reject_empty_input() {
-        let args = OmxHookArgs {
+    fn native_hook_args_reject_empty_input() {
+        let args = NativeHookArgs {
             payload: None,
             file: None,
+            provider: None,
+            source: None,
         };
 
         let error = args
@@ -943,7 +949,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("clawhip omx hook expects a JSON payload")
+                .contains("clawhip native hook expects a JSON payload")
         );
     }
 
@@ -1028,58 +1034,27 @@ mod tests {
     }
 
     #[test]
-    fn parses_hooks_install_subcommand() {
-        let cli = Cli::parse_from(["clawhip", "hooks", "install", "--omc", "--omx"]);
-
-        let Commands::Hooks { command } = cli.command.expect("hooks command") else {
-            panic!("expected hooks command");
-        };
-
-        let HooksCommands::Install(args) = command;
-
-        assert!(args.omc);
-        assert!(args.omx);
-        assert!(!args.all);
-    }
-
-    #[test]
-    fn parses_hooks_install_all_flag() {
-        let cli = Cli::parse_from(["clawhip", "hooks", "install", "--all"]);
-
-        let Commands::Hooks { command } = cli.command.expect("hooks command") else {
-            panic!("expected hooks command");
-        };
-
-        let HooksCommands::Install(args) = command;
-
-        assert!(!args.omc);
-        assert!(!args.omx);
-        assert!(args.all);
-    }
-
-    #[test]
-    fn parses_hooks_install_with_dir_overrides() {
+    fn parses_native_install_with_root_override() {
         let cli = Cli::parse_from([
             "clawhip",
-            "hooks",
+            "native",
             "install",
-            "--omc",
-            "--omc-dir",
-            "/tmp/claude-hooks",
-            "--omx",
-            "--omx-dir",
-            "/tmp/omx-hooks",
+            "--provider",
+            "codex",
+            "--root",
+            "/tmp/repo",
         ]);
 
-        let Commands::Hooks { command } = cli.command.expect("hooks command") else {
-            panic!("expected hooks command");
+        let Commands::Native { command } = cli.command.expect("native command") else {
+            panic!("expected native command");
         };
 
-        let HooksCommands::Install(args) = command;
+        let NativeCommands::Install(args) = command else {
+            panic!("expected native install command");
+        };
 
-        assert!(args.omc);
-        assert!(args.omx);
-        assert_eq!(args.omc_dir, Some(PathBuf::from("/tmp/claude-hooks")));
-        assert_eq!(args.omx_dir, Some(PathBuf::from("/tmp/omx-hooks")));
+        assert_eq!(args.provider, crate::native_hooks::NativeProvider::Codex);
+        assert_eq!(args.scope, crate::native_hooks::NativeInstallScope::Project);
+        assert_eq!(args.root, Some(PathBuf::from("/tmp/repo")));
     }
 }
