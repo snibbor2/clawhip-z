@@ -52,6 +52,17 @@ struct TmuxMonitorArgs {
     registered_at: String,
     registration_source: RegistrationSource,
     parent_process: Option<ParentProcessInfo>,
+    heartbeat_mins: u64,
+    detect_waiting: bool,
+    summarize: bool,
+    summarizer: String,
+    min_new_lines: usize,
+    summarize_interval_mins: u64,
+    pin_status: bool,
+    pin_summary: bool,
+    pin_activity: bool,
+    pin_alerts: bool,
+    pin_keywords: bool,
 }
 
 impl From<&TmuxNewArgs> for TmuxMonitorArgs {
@@ -68,6 +79,17 @@ impl From<&TmuxNewArgs> for TmuxMonitorArgs {
             registered_at: current_timestamp_rfc3339(),
             registration_source: RegistrationSource::CliNew,
             parent_process: current_parent_process_info(),
+            heartbeat_mins: value.heartbeat_mins,
+            detect_waiting: value.detect_waiting,
+            summarize: value.summarize,
+            summarizer: value.summarizer.clone(),
+            min_new_lines: value.min_new_lines,
+            summarize_interval_mins: value.summarize_interval_mins,
+            pin_status: value.pin_status,
+            pin_summary: value.pin_summary,
+            pin_activity: value.pin_activity,
+            pin_alerts: value.pin_alerts,
+            pin_keywords: value.pin_keywords,
         }
     }
 }
@@ -100,6 +122,17 @@ impl From<&TmuxWatchArgs> for TmuxMonitorArgs {
             registered_at: current_timestamp_rfc3339(),
             registration_source: RegistrationSource::CliWatch,
             parent_process: current_parent_process_info(),
+            heartbeat_mins: value.heartbeat_mins,
+            detect_waiting: value.detect_waiting,
+            summarize: value.summarize,
+            summarizer: value.summarizer.clone(),
+            min_new_lines: value.min_new_lines,
+            summarize_interval_mins: value.summarize_interval_mins,
+            pin_status: value.pin_status,
+            pin_summary: value.pin_summary,
+            pin_activity: value.pin_activity,
+            pin_alerts: value.pin_alerts,
+            pin_keywords: value.pin_keywords,
         }
     }
 }
@@ -119,6 +152,17 @@ impl From<TmuxMonitorArgs> for RegisteredTmuxSession {
             registration_source: value.registration_source,
             parent_process: value.parent_process,
             active_wrapper_monitor: true,
+            heartbeat_mins: value.heartbeat_mins,
+            detect_waiting: value.detect_waiting,
+            summarize: value.summarize,
+            summarizer: value.summarizer,
+            min_new_lines: value.min_new_lines,
+            summarize_interval_mins: value.summarize_interval_mins,
+            pin_status: value.pin_status,
+            pin_summary: value.pin_summary,
+            pin_activity: value.pin_activity,
+            pin_alerts: value.pin_alerts,
+            pin_keywords: value.pin_keywords,
             ..Default::default()
         }
     }
@@ -472,23 +516,12 @@ mod tests {
     fn build_command_to_send_preserves_shell_arguments_when_joining() {
         let args = TmuxNewArgs {
             session: "dev".into(),
-            window_name: None,
-            cwd: None,
-            channel: None,
-            mention: None,
-            keywords: Vec::new(),
-            stale_minutes: 10,
-            format: None,
-            attach: false,
-            retry_enter: true,
-            retry_enter_count: crate::cli::DEFAULT_RETRY_ENTER_COUNT,
-            retry_enter_delay_ms: crate::cli::DEFAULT_RETRY_ENTER_DELAY_MS,
-            shell: None,
             command: vec![
                 "zsh".into(),
                 "-c".into(),
                 "source ~/.zshrc && omx --madmax".into(),
             ],
+            ..Default::default()
         };
 
         assert_eq!(
@@ -501,19 +534,9 @@ mod tests {
     fn build_command_to_send_wraps_joined_command_with_override_shell() {
         let args = TmuxNewArgs {
             session: "dev".into(),
-            window_name: None,
-            cwd: None,
-            channel: None,
-            mention: None,
-            keywords: Vec::new(),
-            stale_minutes: 10,
-            format: None,
-            attach: false,
-            retry_enter: true,
-            retry_enter_count: crate::cli::DEFAULT_RETRY_ENTER_COUNT,
-            retry_enter_delay_ms: crate::cli::DEFAULT_RETRY_ENTER_DELAY_MS,
             shell: Some("/bin/zsh".into()),
             command: vec!["source ~/.zshrc && omx --madmax".into()],
+            ..Default::default()
         };
 
         assert_eq!(
@@ -526,19 +549,8 @@ mod tests {
     fn build_command_to_send_leaves_single_shell_snippet_unquoted_without_override() {
         let args = TmuxNewArgs {
             session: "dev".into(),
-            window_name: None,
-            cwd: None,
-            channel: None,
-            mention: None,
-            keywords: Vec::new(),
-            stale_minutes: 10,
-            format: None,
-            attach: false,
-            retry_enter: true,
-            retry_enter_count: crate::cli::DEFAULT_RETRY_ENTER_COUNT,
-            retry_enter_delay_ms: crate::cli::DEFAULT_RETRY_ENTER_DELAY_MS,
-            shell: None,
             command: vec!["source ~/.zshrc && omx --madmax".into()],
+            ..Default::default()
         };
 
         assert_eq!(
@@ -557,6 +569,7 @@ mod tests {
             stale_minutes: 15,
             format: Some(TmuxWrapperFormat::Inline),
             retry_enter: true,
+            ..Default::default()
         };
 
         let monitor_args = TmuxMonitorArgs::from(&args);
@@ -595,6 +608,17 @@ mod tests {
                 pid: 99,
                 name: Some("bash".into()),
             }),
+            heartbeat_mins: 1,
+            detect_waiting: true,
+            summarize: true,
+            summarizer: "gemini".into(),
+            min_new_lines: 0,
+            summarize_interval_mins: 1,
+            pin_status: true,
+            pin_summary: false,
+            pin_activity: true,
+            pin_alerts: true,
+            pin_keywords: true,
         }
         .into();
 
@@ -642,19 +666,8 @@ mod tests {
     fn new_args_auto_resolve_channel_from_routes() {
         let args = TmuxNewArgs {
             session: "xeroclaw-22".into(),
-            window_name: None,
-            cwd: None,
-            channel: None,
-            mention: None,
-            keywords: Vec::new(),
-            stale_minutes: 10,
-            format: None,
-            attach: false,
-            retry_enter: true,
-            retry_enter_count: crate::cli::DEFAULT_RETRY_ENTER_COUNT,
-            retry_enter_delay_ms: crate::cli::DEFAULT_RETRY_ENTER_DELAY_MS,
-            shell: None,
             command: vec!["codex".into()],
+            ..Default::default()
         };
         let config = AppConfig {
             defaults: DefaultsConfig {
@@ -686,19 +699,9 @@ mod tests {
         let repo = init_git_repo();
         let args = TmuxNewArgs {
             session: "clawhip-issue-152".into(),
-            window_name: None,
             cwd: Some(repo.path().to_string_lossy().into_owned()),
-            channel: None,
-            mention: None,
-            keywords: Vec::new(),
-            stale_minutes: 10,
-            format: None,
-            attach: false,
-            retry_enter: true,
-            retry_enter_count: crate::cli::DEFAULT_RETRY_ENTER_COUNT,
-            retry_enter_delay_ms: crate::cli::DEFAULT_RETRY_ENTER_DELAY_MS,
-            shell: None,
             command: vec!["codex".into()],
+            ..Default::default()
         };
         let repo_name = repo
             .path()
@@ -744,19 +747,9 @@ mod tests {
     fn new_args_keep_explicit_channel_over_route_resolution() {
         let args = TmuxNewArgs {
             session: "xeroclaw-22".into(),
-            window_name: None,
-            cwd: None,
             channel: Some("manual".into()),
-            mention: None,
-            keywords: Vec::new(),
-            stale_minutes: 10,
-            format: None,
-            attach: false,
-            retry_enter: true,
-            retry_enter_count: crate::cli::DEFAULT_RETRY_ENTER_COUNT,
-            retry_enter_delay_ms: crate::cli::DEFAULT_RETRY_ENTER_DELAY_MS,
-            shell: None,
             command: vec!["codex".into()],
+            ..Default::default()
         };
         let config = AppConfig {
             defaults: DefaultsConfig {

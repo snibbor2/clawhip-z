@@ -433,7 +433,7 @@ impl From<TmuxWrapperFormat> for MessageFormat {
     }
 }
 
-#[derive(Debug, Clone, Args)]
+#[derive(Debug, Clone, Args, Default)]
 pub struct TmuxNewArgs {
     #[arg(short = 's', long = "session")]
     pub session: String,
@@ -447,7 +447,7 @@ pub struct TmuxNewArgs {
     pub mention: Option<String>,
     #[arg(long, value_delimiter = ',')]
     pub keywords: Vec<String>,
-    #[arg(long, default_value_t = 10)]
+    #[arg(long, default_value_t = 3)]
     pub stale_minutes: u64,
     #[arg(long)]
     pub format: Option<TmuxWrapperFormat>,
@@ -461,11 +461,44 @@ pub struct TmuxNewArgs {
     pub retry_enter_delay_ms: u64,
     #[arg(long)]
     pub shell: Option<String>,
+    /// Send a heartbeat notification every N minutes (0 = disabled).
+    #[arg(long, default_value_t = 1)]
+    pub heartbeat_mins: u64,
+    /// Detect when the session is waiting for user input.
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    pub detect_waiting: bool,
+    /// Summarize pane output before delivery.
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    pub summarize: bool,
+    /// Summarizer backend (raw, gemini, gemini:<model>, openai:<model>, openrouter:<model>).
+    #[arg(long, default_value = "gemini")]
+    pub summarizer: String,
+    /// Minimum new lines required before sending a summary.
+    #[arg(long, default_value_t = 0)]
+    pub min_new_lines: usize,
+    /// How often to send summaries in minutes (0 = every heartbeat).
+    #[arg(long, default_value_t = 1)]
+    pub summarize_interval_mins: u64,
+    /// Pin the status slot as a persistent Discord message.
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    pub pin_status: bool,
+    /// Pin the summary slot as a persistent Discord message.
+    #[arg(long, default_value_t = false, action = ArgAction::Set)]
+    pub pin_summary: bool,
+    /// Pin the activity log slot as a persistent Discord message.
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    pub pin_activity: bool,
+    /// Pin the alert slot as a persistent Discord message.
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    pub pin_alerts: bool,
+    /// Pin the keyword hits slot as a persistent Discord message.
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    pub pin_keywords: bool,
     #[arg(last = true, allow_hyphen_values = true)]
     pub command: Vec<String>,
 }
 
-#[derive(Debug, Clone, Args)]
+#[derive(Debug, Clone, Args, Default)]
 pub struct TmuxWatchArgs {
     #[arg(short = 's', long = "session")]
     pub session: String,
@@ -475,12 +508,45 @@ pub struct TmuxWatchArgs {
     pub mention: Option<String>,
     #[arg(long, value_delimiter = ',')]
     pub keywords: Vec<String>,
-    #[arg(long, default_value_t = 10)]
+    #[arg(long, default_value_t = 3)]
     pub stale_minutes: u64,
     #[arg(long)]
     pub format: Option<TmuxWrapperFormat>,
     #[arg(long, default_value_t = true, action = ArgAction::Set)]
     pub retry_enter: bool,
+    /// Send a heartbeat notification every N minutes (0 = disabled).
+    #[arg(long, default_value_t = 1)]
+    pub heartbeat_mins: u64,
+    /// Detect when the session is waiting for user input.
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    pub detect_waiting: bool,
+    /// Summarize pane output before delivery.
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    pub summarize: bool,
+    /// Summarizer backend (raw, gemini, gemini:<model>, openai:<model>, openrouter:<model>).
+    #[arg(long, default_value = "gemini")]
+    pub summarizer: String,
+    /// Minimum new lines required before sending a summary.
+    #[arg(long, default_value_t = 0)]
+    pub min_new_lines: usize,
+    /// How often to send summaries in minutes (0 = every heartbeat).
+    #[arg(long, default_value_t = 1)]
+    pub summarize_interval_mins: u64,
+    /// Pin the status slot as a persistent Discord message.
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    pub pin_status: bool,
+    /// Pin the summary slot as a persistent Discord message.
+    #[arg(long, default_value_t = false, action = ArgAction::Set)]
+    pub pin_summary: bool,
+    /// Pin the activity log slot as a persistent Discord message.
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    pub pin_activity: bool,
+    /// Pin the alert slot as a persistent Discord message.
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    pub pin_alerts: bool,
+    /// Pin the keyword hits slot as a persistent Discord message.
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    pub pin_keywords: bool,
 }
 
 #[derive(Debug, Clone, Subcommand)]
