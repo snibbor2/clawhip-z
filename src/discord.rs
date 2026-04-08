@@ -113,7 +113,9 @@ impl DiscordClient {
                     return Ok(());
                 }
                 Err(error) => {
-                    self.record_failure(&key);
+                    if is_infrastructure_failure(&error) {
+                        self.record_failure(&key);
+                    }
                     if let Some(retry_after) = error.retry_after
                         && attempt < MAX_ATTEMPTS
                     {
@@ -268,6 +270,18 @@ impl DiscordClient {
             .entries()
             .to_vec()
     }
+}
+
+/// Returns true only for infrastructure failures (5xx, network/connection errors).
+/// Discord API policy rejections (4xx: 404, 400/30046, 401, 429) are NOT infrastructure
+/// failures and should not open the circuit breaker — they are handled at each call site.
+fn is_infrastructure_failure(error: &DiscordSendError) -> bool {
+    let m = &error.message;
+    m.contains("500 ")
+        || m.contains("502 ")
+        || m.contains("503 ")
+        || m.contains("504 ")
+        || (m.contains("failed:") && !m.contains("failed with"))
 }
 
 fn parse_retry_after(status: StatusCode, body: &str) -> Option<Duration> {
