@@ -270,7 +270,9 @@ impl DiscordClient {
                     return Ok(());
                 }
                 Err(error) => {
-                    self.record_failure(&key);
+                    if is_infrastructure_failure(&error) {
+                        self.record_failure(&key);
+                    }
                     if let Some(retry_after) = error.retry_after
                         && attempt < MAX_ATTEMPTS
                     {
@@ -381,8 +383,12 @@ impl DiscordClient {
         if let Some(msg_id) = existing_id {
             match self.edit_message(channel_id, &msg_id, content).await {
                 Ok(()) => return Ok(()),
-                Err(e) if e.message.contains("404") || e.message.contains("Unknown Message") => {
-                    // Message was deleted; fall through to create a new one
+                Err(e)
+                    if e.message.contains("404")
+                        || e.message.contains("Unknown Message")
+                        || e.message.contains("30046") =>
+                {
+                    crate::debug_log!("discord: EDIT failed (404/30046), falling back to CREATE for {edit_key}");
                 }
                 Err(e) => return Err(e),
             }
@@ -441,7 +447,13 @@ impl DiscordClient {
                         .insert(key, content_to_send);
                     return Ok(());
                 }
-                Err(e) if e.message.contains("404") || e.message.contains("Unknown Message") => {}
+                Err(e)
+                    if e.message.contains("404")
+                        || e.message.contains("Unknown Message")
+                        || e.message.contains("30046") =>
+                {
+                    crate::debug_log!("discord: EDIT keyword failed (404/30046), falling back to CREATE");
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -635,7 +647,23 @@ impl DiscordClient {
         if let Some(msg_id) = existing_id {
             match self.edit_message(channel_id, &msg_id, content).await {
                 Ok(()) => return Ok(()),
-                Err(e) if e.message.contains("404") || e.message.contains("Unknown Message") => {
+                Err(e)
+                    if e.message.contains("404")
+                        || e.message.contains("Unknown Message")
+                        || e.message.contains("30046") =>
+                {
+                    let reason = if e.message.contains("30046") {
+                        "STALE (30046)"
+                    } else {
+                        "NOT FOUND (404)"
+                    };
+                    crate::debug_log!(
+                        "discord: dashboard EDIT slot={slot} session={session} msg_id={msg_id} {reason} — unpin+recreate"
+                    );
+                    // Unpin the stale message so it doesn't linger in the channel pin list
+                    if e.message.contains("30046") {
+                        let _ = self.unpin_message(channel_id, &msg_id).await;
+                    }
                     let mut state = self.state.lock().expect("discord state lock");
                     if let Some(ids) = state.dashboard_ids.get_mut(&slot_key) {
                         match slot {
@@ -777,6 +805,18 @@ impl DiscordClient {
             .entries()
             .to_vec()
     }
+}
+
+/// Returns true only for infrastructure failures (5xx, network/connection errors).
+/// Discord API policy rejections (4xx: 404, 400/30046, 401, 429) are NOT infrastructure
+/// failures and should not open the circuit breaker — they are handled at each call site.
+fn is_infrastructure_failure(error: &DiscordSendError) -> bool {
+    let m = &error.message;
+    m.contains("500 ")
+        || m.contains("502 ")
+        || m.contains("503 ")
+        || m.contains("504 ")
+        || (m.contains("failed:") && !m.contains("failed with"))
 }
 
 fn parse_retry_after(status: StatusCode, body: &str) -> Option<Duration> {

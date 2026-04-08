@@ -257,6 +257,8 @@ struct TmuxMonitorState {
     pending_keyword_hits: HashMap<String, PendingKeywordHits>,
     session_last_heartbeat: HashMap<String, Instant>,
     session_last_summarized: HashMap<String, Instant>,
+    /// Content snapshot at time of last summarization, used to check min_new_lines threshold.
+    session_last_summarized_snapshot: HashMap<String, String>,
 }
 
 struct TmuxPaneSnapshot {
@@ -276,6 +278,7 @@ pub async fn monitor_registered_session(
     let mut pending_keyword_hits = None;
     let mut last_heartbeat = None;
     let mut last_summarized: Option<Instant> = None;
+    let mut last_summarized_snapshot: Option<String> = None;
     let poll_interval = Duration::from_secs(1);
 
     loop {
@@ -337,8 +340,6 @@ pub async fn monitor_registered_session(
                 Some(existing) => {
                     existing.pane_dead = pane.pane_dead;
                     if existing.content_hash != hash {
-                        existing.last_activity_rfc3339 = Some(current_timestamp_rfc3339());
-
                         // Determine if this is a significant content change (not just animation).
                         // Must be computed before summarization so we don't summarize idle frames.
                         let new_stable = content_hash_stable(&pane.content);
@@ -347,6 +348,8 @@ pub async fn monitor_registered_session(
                                 > STABLE_CHANGE_THRESHOLD;
                         if significant_change {
                             existing.last_stable_change = now;
+                            // Only advance last_activity on real content changes, not animation frames.
+                            existing.last_activity_rfc3339 = Some(current_timestamp_rfc3339());
                         }
                         existing.stable_hash = new_stable;
 
@@ -356,29 +359,6 @@ pub async fn monitor_registered_session(
                             &registration.keywords,
                         );
                         push_pending_keyword_hits(&mut pending_keyword_hits, now, hits);
-
-                        // Only summarize on significant content changes, not animation/idle updates.
-                        if registration.summarize
-                            && significant_change
-                            && should_summarize_now(
-                                last_summarized,
-                                registration.effective_summary_interval(),
-                                registration.min_new_lines,
-                                &existing.snapshot,
-                                &pane.content,
-                                now,
-                            )
-                        {
-                            spawn_content_changed_task(
-                                client.clone(),
-                                registration.clone(),
-                                pane.session.clone(),
-                                pane.pane_name.clone(),
-                                pane.content.clone(),
-                                providers.clone(),
-                            );
-                            last_summarized = Some(now);
-                        }
 
                         if registration.detect_waiting {
                             let waiting_prompt = is_waiting_for_input(&pane.content);
@@ -433,6 +413,16 @@ pub async fn monitor_registered_session(
             &client,
             &panes,
             &mut last_heartbeat,
+            Instant::now(),
+        )
+        .await?;
+        maybe_emit_registered_session_summary(
+            &registration,
+            &client,
+            &panes,
+            &mut last_summarized,
+            &mut last_summarized_snapshot,
+            providers.clone(),
             Instant::now(),
         )
         .await?;
@@ -617,8 +607,6 @@ async fn poll_tmux(
                         Some(existing) => {
                             existing.pane_dead = pane.pane_dead;
                             if existing.content_hash != hash {
-                                existing.last_activity_rfc3339 = Some(current_timestamp_rfc3339());
-
                                 // Determine if this is a significant content change (not just animation).
                                 // Must be computed before summarization so we don't summarize idle frames.
                                 let new_stable = content_hash_stable(&pane.content);
@@ -627,6 +615,8 @@ async fn poll_tmux(
                                         > STABLE_CHANGE_THRESHOLD;
                                 if significant_change {
                                     existing.last_stable_change = now;
+                                    // Only advance last_activity on real content changes, not animation frames.
+                                    existing.last_activity_rfc3339 = Some(current_timestamp_rfc3339());
                                 }
                                 existing.stable_hash = new_stable;
 
@@ -635,31 +625,6 @@ async fn poll_tmux(
                                     &pane.content,
                                     &registration.keywords,
                                 );
-                                // Only summarize on significant content changes, not animation/idle updates.
-                                if registration.summarize
-                                    && significant_change
-                                    && should_summarize_now(
-                                        state.session_last_summarized.get(session_name).copied(),
-                                        registration.effective_summary_interval(),
-                                        registration.min_new_lines,
-                                        &existing.snapshot,
-                                        &pane.content,
-                                        now,
-                                    )
-                                {
-                                    spawn_content_changed_task(
-                                        tx.clone(),
-                                        registration.clone(),
-                                        session_name.clone(),
-                                        pane.pane_name.clone(),
-                                        pane.content.clone(),
-                                        config.providers.clone(),
-                                    );
-                                    state
-                                        .session_last_summarized
-                                        .insert(session_name.to_string(), now);
-                                }
-
                                 if registration.detect_waiting {
                                     let waiting_prompt = is_waiting_for_input(&pane.content);
                                     match (existing.is_waiting, &waiting_prompt) {
@@ -729,6 +694,68 @@ async fn poll_tmux(
                 )
                 .await?;
 
+                // Interval-based summarization: fire only when stable content changed since last summary
+                if registration.summarize {
+                    let last_sum = state.session_last_summarized.get(session_name).copied();
+                    let last_sum_snapshot = state.session_last_summarized_snapshot
+                        .get(session_name)
+                        .cloned();
+
+                    // Check interval
+                    let interval_secs = registration.effective_summary_interval() * 60;
+                    let interval_elapsed = if interval_secs == 0 {
+                        true
+                    } else {
+                        last_sum
+                            .map(|t| now.duration_since(t).as_secs() >= interval_secs)
+                            .unwrap_or(true)
+                    };
+
+                    if interval_elapsed {
+                        let last_stable = state
+                            .panes
+                            .values()
+                            .filter(|p| p.session == *session_name)
+                            .map(|p| p.last_stable_change)
+                            .max();
+                        let changed = if let Some(ls) = last_stable {
+                            let last_sum_time = last_sum
+                                .unwrap_or_else(|| now - Duration::from_secs(interval_secs + 1));
+                            ls > last_sum_time || last_sum.is_none()
+                        } else {
+                            false
+                        };
+
+                        if changed {
+                            if let Some(pane) = state
+                                .panes
+                                .values()
+                                .find(|p| p.session == *session_name)
+                            {
+                                let min_ok = registration.min_new_lines == 0
+                                    || count_new_lines(
+                                        last_sum_snapshot.as_deref().unwrap_or(""),
+                                        &pane.snapshot,
+                                    ) >= registration.min_new_lines;
+                                if min_ok {
+                                    let snapshot = pane.snapshot.clone();
+                                    let pane_name = pane.pane_name.clone();
+                                    spawn_content_changed_task(
+                                        tx.clone(),
+                                        registration.clone(),
+                                        session_name.clone(),
+                                        pane_name,
+                                        snapshot.clone(),
+                                        config.providers.clone(),
+                                    );
+                                    state.session_last_summarized.insert(session_name.to_string(), now);
+                                    state.session_last_summarized_snapshot.insert(session_name.to_string(), snapshot);
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // Update live state in registry for this session
                 let live = build_session_live_state(session_name, &state.panes);
                 {
@@ -762,6 +789,9 @@ async fn poll_tmux(
         .retain(|session, _| sessions.contains_key(session));
     state
         .session_last_summarized
+        .retain(|session, _| sessions.contains_key(session));
+    state
+        .session_last_summarized_snapshot
         .retain(|session, _| sessions.contains_key(session));
 
     Ok(())
@@ -1202,6 +1232,70 @@ async fn maybe_emit_registered_session_heartbeat<E: EventEmitter>(
         ))
         .await?;
     *last_heartbeat_at = now;
+    Ok(())
+}
+
+/// Emit a summarization task at interval ticks, but only when stable content
+/// changed since the last summary and the min_new_lines threshold is met.
+/// This replaces the old eager per-change summarization.
+async fn maybe_emit_registered_session_summary<E: EventEmitter + Clone + Send + Sync + 'static>(
+    registration: &RegisteredTmuxSession,
+    emitter: &E,
+    panes: &HashMap<String, TmuxPaneState>,
+    last_summarized: &mut Option<Instant>,
+    last_summarized_snapshot: &mut Option<String>,
+    providers: crate::config::ProvidersConfig,
+    now: Instant,
+) -> Result<()> {
+    if !registration.summarize || registration.effective_summary_interval() == 0 {
+        return Ok(());
+    }
+
+    let interval = Duration::from_secs(registration.effective_summary_interval() * 60);
+
+    // Check: has enough time elapsed since last summary?
+    let interval_elapsed = last_summarized
+        .map(|t| now.duration_since(t) >= interval)
+        .unwrap_or(true);
+    if !interval_elapsed {
+        return Ok(());
+    }
+
+    // Check: did stable content change since last summary?
+    let Some(last_stable_change) = panes.values().map(|p| p.last_stable_change).max() else {
+        return Ok(());
+    };
+    let last_sum_time = last_summarized
+        .unwrap_or_else(|| now - interval - Duration::from_secs(1));
+    if last_stable_change <= last_sum_time && last_summarized.is_some() {
+        return Ok(());
+    }
+
+    // Get current pane snapshot
+    let Some(pane) = panes.values().next() else {
+        return Ok(());
+    };
+
+    // Check min_new_lines threshold against snapshot at last summary
+    if registration.min_new_lines > 0 {
+        let old = last_summarized_snapshot.as_deref().unwrap_or("");
+        if count_new_lines(old, &pane.snapshot) < registration.min_new_lines {
+            return Ok(());
+        }
+    }
+
+    // All conditions met — fire summary
+    *last_summarized = Some(now);
+    *last_summarized_snapshot = Some(pane.snapshot.clone());
+
+    spawn_content_changed_task(
+        emitter.clone(),
+        registration.clone(),
+        pane.session.clone(),
+        pane.pane_name.clone(),
+        pane.snapshot.clone(),
+        providers,
+    );
     Ok(())
 }
 
