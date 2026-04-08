@@ -338,6 +338,18 @@ pub async fn monitor_registered_session(
                     existing.pane_dead = pane.pane_dead;
                     if existing.content_hash != hash {
                         existing.last_activity_rfc3339 = Some(current_timestamp_rfc3339());
+
+                        // Determine if this is a significant content change (not just animation).
+                        // Must be computed before summarization so we don't summarize idle frames.
+                        let new_stable = content_hash_stable(&pane.content);
+                        let significant_change = existing.stable_hash != new_stable
+                            && count_changed_lines(&existing.snapshot, &pane.content)
+                                > STABLE_CHANGE_THRESHOLD;
+                        if significant_change {
+                            existing.last_stable_change = now;
+                        }
+                        existing.stable_hash = new_stable;
+
                         let hits = collect_keyword_hits(
                             &existing.snapshot,
                             &pane.content,
@@ -345,7 +357,9 @@ pub async fn monitor_registered_session(
                         );
                         push_pending_keyword_hits(&mut pending_keyword_hits, now, hits);
 
+                        // Only summarize on significant content changes, not animation/idle updates.
                         if registration.summarize
+                            && significant_change
                             && should_summarize_now(
                                 last_summarized,
                                 registration.effective_summary_interval(),
@@ -391,16 +405,6 @@ pub async fn monitor_registered_session(
                                 _ => {}
                             }
                             existing.is_waiting = waiting_prompt.is_some();
-                        }
-
-                        let new_stable = content_hash_stable(&pane.content);
-                        if existing.stable_hash != new_stable {
-                            if count_changed_lines(&existing.snapshot, &pane.content)
-                                > STABLE_CHANGE_THRESHOLD
-                            {
-                                existing.last_stable_change = now;
-                            }
-                            existing.stable_hash = new_stable;
                         }
                         existing.session = pane.session;
                         existing.pane_name = pane.pane_name;
@@ -614,12 +618,26 @@ async fn poll_tmux(
                             existing.pane_dead = pane.pane_dead;
                             if existing.content_hash != hash {
                                 existing.last_activity_rfc3339 = Some(current_timestamp_rfc3339());
+
+                                // Determine if this is a significant content change (not just animation).
+                                // Must be computed before summarization so we don't summarize idle frames.
+                                let new_stable = content_hash_stable(&pane.content);
+                                let significant_change = existing.stable_hash != new_stable
+                                    && count_changed_lines(&existing.snapshot, &pane.content)
+                                        > STABLE_CHANGE_THRESHOLD;
+                                if significant_change {
+                                    existing.last_stable_change = now;
+                                }
+                                existing.stable_hash = new_stable;
+
                                 let hits = collect_keyword_hits(
                                     &existing.snapshot,
                                     &pane.content,
                                     &registration.keywords,
                                 );
+                                // Only summarize on significant content changes, not animation/idle updates.
                                 if registration.summarize
+                                    && significant_change
                                     && should_summarize_now(
                                         state.session_last_summarized.get(session_name).copied(),
                                         registration.effective_summary_interval(),
@@ -665,15 +683,6 @@ async fn poll_tmux(
                                         _ => {}
                                     }
                                     existing.is_waiting = waiting_prompt.is_some();
-                                }
-                                let new_stable = content_hash_stable(&pane.content);
-                                if existing.stable_hash != new_stable {
-                                    if count_changed_lines(&existing.snapshot, &pane.content)
-                                        > STABLE_CHANGE_THRESHOLD
-                                    {
-                                        existing.last_stable_change = now;
-                                    }
-                                    existing.stable_hash = new_stable;
                                 }
                                 existing.pane_name = pane.pane_name;
                                 existing.snapshot = pane.content;
