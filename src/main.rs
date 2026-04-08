@@ -626,7 +626,7 @@ mod tests {
         let mut reg = make_registration("issue-105");
         reg.keywords = vec!["error".into()];
         reg.summarize = true;
-        reg.heartbeat_interval = 5;
+        reg.heartbeat_interval = 5.0;
         reg.detect_waiting = true;
         reg.live_state = Some(SessionLiveState {
             is_waiting: false,

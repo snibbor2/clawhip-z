@@ -50,6 +50,7 @@ struct DiscordState {
     last_heartbeat_msg_ids: HashMap<String, String>,
     /// Accumulated rendered content for append-only keyword messages.
     /// Key: "{channel_id}:keywords:{session}".
+    #[allow(dead_code)]
     accumulated_keyword_content: HashMap<String, String>,
     /// Dashboard message IDs per "{channel}:{session}".
     dashboard_ids: HashMap<String, DashboardSlotIds>,
@@ -409,6 +410,7 @@ impl DiscordClient {
 
     /// Append new keyword hits to an existing message, or post a new one if none exists.
     /// When appended content would exceed the Discord limit, starts a fresh message.
+    #[allow(dead_code)]
     async fn append_keyword_keyed(
         &self,
         channel_id: &str,
