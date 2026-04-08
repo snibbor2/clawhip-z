@@ -103,7 +103,7 @@ pub async fn run(
         .route("/api/native/hook", post(post_native_hook))
         .route("/api/tmux/register", post(register_tmux))
         .route("/api/tmux", get(list_tmux))
-        .route("/api/tmux/:session/live-state", patch(patch_live_state))
+        .route("/api/tmux/{session}/live-state", patch(patch_live_state))
         .route("/github", post(post_github))
         .route("/api/update/status", get(update_status))
         .route("/api/update/approve", post(approve_update))
