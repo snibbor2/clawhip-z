@@ -461,9 +461,9 @@ pub struct TmuxNewArgs {
     pub retry_enter_delay_ms: u64,
     #[arg(long)]
     pub shell: Option<String>,
-    /// Send a heartbeat notification every N minutes (0 = disabled).
-    #[arg(long, default_value_t = 1)]
-    pub heartbeat_mins: u64,
+    /// Send a heartbeat notification every N minutes (0 = disabled). Supports fractional values (e.g. 0.333 ≈ 20s).
+    #[arg(long, default_value_t = 1.0)]
+    pub heartbeat_mins: f64,
     /// Detect when the session is waiting for user input.
     #[arg(long, default_value_t = true, action = ArgAction::Set)]
     pub detect_waiting: bool,
@@ -514,9 +514,9 @@ pub struct TmuxWatchArgs {
     pub format: Option<TmuxWrapperFormat>,
     #[arg(long, default_value_t = true, action = ArgAction::Set)]
     pub retry_enter: bool,
-    /// Send a heartbeat notification every N minutes (0 = disabled).
-    #[arg(long, default_value_t = 1)]
-    pub heartbeat_mins: u64,
+    /// Send a heartbeat notification every N minutes (0 = disabled). Supports fractional values (e.g. 0.333 ≈ 20s).
+    #[arg(long, default_value_t = 1.0)]
+    pub heartbeat_mins: f64,
     /// Detect when the session is waiting for user input.
     #[arg(long, default_value_t = true, action = ArgAction::Set)]
     pub detect_waiting: bool,

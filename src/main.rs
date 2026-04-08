@@ -556,7 +556,7 @@ fn format_tmux_list(
     fn format_features(r: &RegisteredTmuxSession) -> String {
         let mut parts = Vec::new();
         let heartbeat = r.heartbeat_interval.max(r.heartbeat_mins);
-        if heartbeat > 0 {
+        if heartbeat > 0.0 {
             parts.push("\u{2665}");
         }
         if r.summarize {
@@ -671,7 +671,7 @@ mod tests {
     #[test]
     fn format_features_shows_heartbeat_and_pins() {
         let mut reg = make_registration("feat-test");
-        reg.heartbeat_mins = 5;
+        reg.heartbeat_mins = 5.0;
         reg.pin_status = true;
         reg.live_state = Some(SessionLiveState::default());
         let output = format_tmux_list(&[reg], false);

@@ -200,13 +200,16 @@ impl DiscordClient {
                                 self.clear_session_dashboard(channel_id, session).await;
                                 return Ok(());
                             }
+                            // When pin_status/pin_summary/pin_alerts/pin_keywords is false,
+                            // no dashboard_component is injected and we land here. Create a
+                            // new Discord message each time rather than editing in-place.
                             "tmux.heartbeat" => {
-                                self.send_or_edit_keyed(
-                                    channel_id,
-                                    &format!("heartbeat:{session}"),
-                                    &message.content,
-                                )
-                                .await
+                                crate::debug_log!(
+                                    "discord: heartbeat NEW session={session} channel={channel_id}"
+                                );
+                                self.send_message_returning_id(channel_id, &message.content)
+                                    .await
+                                    .map(|_| ())
                             }
                             "tmux.waiting_for_input" => {
                                 let content =
@@ -215,24 +218,25 @@ impl DiscordClient {
                                     } else {
                                         message.content.clone()
                                     };
-                                self.send_or_edit_keyed(
-                                    channel_id,
-                                    &format!("waiting:{session}"),
-                                    &content,
-                                )
-                                .await
+                                crate::debug_log!(
+                                    "discord: waiting NEW session={session} channel={channel_id}"
+                                );
+                                self.send_message_returning_id(channel_id, &content)
+                                    .await
+                                    .map(|_| ())
                             }
                             "tmux.content_changed"
                                 if message.payload["content_mode"].as_str() == Some("raw") =>
                             {
-                                self.send_or_edit_keyed(
-                                    channel_id,
-                                    &format!("raw:{session}"),
-                                    &message.content,
-                                )
-                                .await
+                                crate::debug_log!(
+                                    "discord: summary NEW session={session} channel={channel_id}"
+                                );
+                                self.send_message_returning_id(channel_id, &message.content)
+                                    .await
+                                    .map(|_| ())
                             }
                             "tmux.stale" => {
+                                // Stale has no pin flag — deduplicate to avoid repeat alerts.
                                 self.send_or_edit_keyed(
                                     channel_id,
                                     &format!("stale:{session}"),
@@ -241,12 +245,12 @@ impl DiscordClient {
                                 .await
                             }
                             "tmux.keyword" => {
-                                self.append_keyword_keyed(
-                                    channel_id,
-                                    &format!("keywords:{session}"),
-                                    &message.content,
-                                )
-                                .await
+                                crate::debug_log!(
+                                    "discord: keyword NEW session={session} channel={channel_id}"
+                                );
+                                self.send_message_returning_id(channel_id, &message.content)
+                                    .await
+                                    .map(|_| ())
                             }
                             _ => self.send_message(channel_id, &message.content).await,
                         }

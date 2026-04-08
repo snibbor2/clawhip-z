@@ -132,11 +132,10 @@ pub fn truncate_for_summarizer(content: &str) -> &str {
         return content;
     }
     let start = content.len() - MAX_INPUT_CHARS;
-    let start = content[start..]
-        .char_indices()
-        .next()
-        .map(|(i, _)| start + i)
-        .unwrap_or(start);
+    // Advance to the next valid UTF-8 char boundary (multi-byte chars like ╭─ span 3 bytes).
+    let start = (start..=content.len())
+        .find(|&i| content.is_char_boundary(i))
+        .unwrap_or(content.len());
     &content[start..]
 }
 

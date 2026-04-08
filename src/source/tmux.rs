@@ -82,13 +82,13 @@ pub struct RegisteredTmuxSession {
     #[serde(default)]
     pub summarizer: String,
     #[serde(default)]
-    pub heartbeat_mins: u64,
+    pub heartbeat_mins: f64,
     #[serde(default)]
     pub min_new_lines: usize,
     #[serde(default)]
     pub summarize_interval_mins: u64,
     #[serde(default)]
-    pub heartbeat_interval: u64,
+    pub heartbeat_interval: f64,
     #[serde(default)]
     pub summary_interval: u64,
     #[serde(default)]
@@ -113,13 +113,15 @@ pub struct RegisteredTmuxSession {
 }
 
 impl RegisteredTmuxSession {
-    /// Effective heartbeat interval: heartbeat_interval overrides heartbeat_mins when > 0.
-    pub fn effective_heartbeat_mins(&self) -> u64 {
-        if self.heartbeat_interval > 0 {
+    /// Effective heartbeat interval in seconds. heartbeat_interval overrides heartbeat_mins.
+    /// Both support fractional values (e.g. 0.333 ≈ 20s). Returns 0 when disabled.
+    pub fn effective_heartbeat_secs(&self) -> u64 {
+        let mins = if self.heartbeat_interval > 0.0 {
             self.heartbeat_interval
         } else {
             self.heartbeat_mins
-        }
+        };
+        (mins * 60.0).round() as u64
     }
 
     /// Effective summary throttle: summary_interval overrides summarize_interval_mins when > 0.
@@ -237,6 +239,12 @@ struct TmuxPaneState {
     snapshot: String,
     content_hash: u64,
     last_change: Instant,
+    /// Hash of pane content with TUI status-bar lines stripped.
+    /// Only updates when the main conversation area changes, not when the
+    /// OMC/Claude Code status bar ticks (timestamps, token counter, etc.).
+    stable_hash: u64,
+    /// When the stable (non-status-bar) content last changed.
+    last_stable_change: Instant,
     last_stale_notification: Option<Instant>,
     pane_dead: bool,
     is_waiting: bool,
@@ -304,6 +312,7 @@ pub async fn monitor_registered_session(
             active_panes.insert(pane.pane_id.clone());
             let pane_key = pane.pane_id.clone();
             let hash = content_hash(&pane.content);
+            let stable = content_hash_stable(&pane.content);
             let latest_line = last_nonempty_line(&pane.content);
 
             match panes.get_mut(&pane_key) {
@@ -314,8 +323,10 @@ pub async fn monitor_registered_session(
                             session: pane.session,
                             pane_name: pane.pane_name,
                             content_hash: hash,
+                            stable_hash: stable,
                             snapshot: pane.content,
                             last_change: now,
+                            last_stable_change: now,
                             last_stale_notification: None,
                             pane_dead: pane.pane_dead,
                             is_waiting: false,
@@ -382,13 +393,21 @@ pub async fn monitor_registered_session(
                             existing.is_waiting = waiting_prompt.is_some();
                         }
 
+                        let new_stable = content_hash_stable(&pane.content);
+                        if existing.stable_hash != new_stable {
+                            if count_changed_lines(&existing.snapshot, &pane.content)
+                                > STABLE_CHANGE_THRESHOLD
+                            {
+                                existing.last_stable_change = now;
+                            }
+                            existing.stable_hash = new_stable;
+                        }
                         existing.session = pane.session;
                         existing.pane_name = pane.pane_name;
                         existing.content_hash = hash;
                         existing.snapshot = pane.content;
                         existing.last_change = now;
                         existing.last_stale_notification = None;
-                        last_heartbeat = Some(now);
                     } else if should_emit_stale(existing, now, registration.stale_minutes) {
                         client
                             .emit(tmux_stale_event(
@@ -564,6 +583,7 @@ async fn poll_tmux(
                     active_panes.insert(pane_key.clone());
                     let now = Instant::now();
                     let hash = content_hash(&pane.content);
+                    let stable = content_hash_stable(&pane.content);
                     let latest_line = last_nonempty_line(&pane.content);
 
                     let hits = match state.panes.get_mut(&pane_key) {
@@ -575,7 +595,9 @@ async fn poll_tmux(
                                     pane_name: pane.pane_name,
                                     snapshot: pane.content,
                                     content_hash: hash,
+                                    stable_hash: stable,
                                     last_change: now,
+                                    last_stable_change: now,
                                     last_stale_notification: None,
                                     pane_dead: pane.pane_dead,
                                     is_waiting: false,
@@ -643,6 +665,15 @@ async fn poll_tmux(
                                         _ => {}
                                     }
                                     existing.is_waiting = waiting_prompt.is_some();
+                                }
+                                let new_stable = content_hash_stable(&pane.content);
+                                if existing.stable_hash != new_stable {
+                                    if count_changed_lines(&existing.snapshot, &pane.content)
+                                        > STABLE_CHANGE_THRESHOLD
+                                    {
+                                        existing.last_stable_change = now;
+                                    }
+                                    existing.stable_hash = new_stable;
                                 }
                                 existing.pane_name = pane.pane_name;
                                 existing.snapshot = pane.content;
@@ -1061,7 +1092,7 @@ async fn maybe_emit_session_heartbeat<E: EventEmitter>(
     now: Instant,
     session_changed: bool,
 ) -> Result<()> {
-    if registration.effective_heartbeat_mins() == 0 {
+    if registration.effective_heartbeat_secs() == 0 {
         state.session_last_heartbeat.remove(session_name);
         return Ok(());
     }
@@ -1072,12 +1103,12 @@ async fn maybe_emit_session_heartbeat<E: EventEmitter>(
             .insert(session_name.to_string(), now);
     }
 
-    let interval = Duration::from_secs(registration.effective_heartbeat_mins() * 60);
-    let Some(last_change) = state
+    let interval = Duration::from_secs(registration.effective_heartbeat_secs());
+    let Some(last_stable_change) = state
         .panes
         .values()
         .filter(|pane| pane.session == session_name)
-        .map(|pane| pane.last_change)
+        .map(|pane| pane.last_stable_change)
         .max()
     else {
         state
@@ -1087,12 +1118,26 @@ async fn maybe_emit_session_heartbeat<E: EventEmitter>(
         return Ok(());
     };
 
+    // Skip if stable content (conversation area) changed recently — TUI is still active.
+    if now.duration_since(last_stable_change) < interval {
+        crate::debug_log!(
+            "poll_tmux: HEARTBEAT {session_name} skip (stable_since={}s interval={}s)",
+            now.duration_since(last_stable_change).as_secs(),
+            interval.as_secs(),
+        );
+        return Ok(());
+    }
+
     let last_heartbeat = state
         .session_last_heartbeat
         .entry(session_name.to_string())
         .or_insert(now);
-    if now.duration_since(last_change) < interval || now.duration_since(*last_heartbeat) < interval
-    {
+    if now.duration_since(*last_heartbeat) < interval {
+        crate::debug_log!(
+            "poll_tmux: HEARTBEAT {session_name} skip (since_last={}s interval={}s)",
+            now.duration_since(*last_heartbeat).as_secs(),
+            interval.as_secs(),
+        );
         return Ok(());
     }
 
@@ -1100,7 +1145,7 @@ async fn maybe_emit_session_heartbeat<E: EventEmitter>(
         .emit(tmux_heartbeat_event(
             registration,
             session_name.to_string(),
-            now.duration_since(last_change).as_secs() / 60,
+            now.duration_since(last_stable_change).as_secs() / 60,
         ))
         .await?;
     *last_heartbeat = now;
@@ -1114,29 +1159,37 @@ async fn maybe_emit_registered_session_heartbeat<E: EventEmitter>(
     last_heartbeat: &mut Option<Instant>,
     now: Instant,
 ) -> Result<()> {
-    if registration.effective_heartbeat_mins() == 0 {
+    if registration.effective_heartbeat_secs() == 0 {
         *last_heartbeat = None;
         return Ok(());
     }
 
-    let interval = Duration::from_secs(registration.effective_heartbeat_mins() * 60);
-    let Some(last_change) = panes.values().map(|pane| pane.last_change).max() else {
+    let interval = Duration::from_secs(registration.effective_heartbeat_secs());
+    let Some(last_stable_change) = panes.values().map(|pane| pane.last_stable_change).max() else {
         last_heartbeat.get_or_insert(now);
         return Ok(());
     };
 
-    let last_heartbeat_at = last_heartbeat.get_or_insert(now);
-    if now.duration_since(last_change) < interval
-        || now.duration_since(*last_heartbeat_at) < interval
-    {
+    let stable_secs = now.duration_since(last_stable_change).as_secs();
+    // Skip if stable content (conversation area) changed recently — TUI is still active.
+    if now.duration_since(last_stable_change) < interval {
+        crate::debug_log!("HEARTBEAT {} skip (stable_since={}s interval={}s)", registration.session, stable_secs, interval.as_secs());
         return Ok(());
     }
 
+    let last_heartbeat_at = last_heartbeat.get_or_insert(now);
+    let since_last = now.duration_since(*last_heartbeat_at).as_secs();
+    if now.duration_since(*last_heartbeat_at) < interval {
+        crate::debug_log!("HEARTBEAT {} skip (since_last={}s interval={}s)", registration.session, since_last, interval.as_secs());
+        return Ok(());
+    }
+
+    crate::debug_log!("HEARTBEAT {} EMIT (stable_since={}s)", registration.session, stable_secs);
     emitter
         .emit(tmux_heartbeat_event(
             registration,
             registration.session.clone(),
-            now.duration_since(last_change).as_secs() / 60,
+            now.duration_since(last_stable_change).as_secs() / 60,
         ))
         .await?;
     *last_heartbeat_at = now;
@@ -1439,6 +1492,35 @@ pub(crate) fn content_hash(content: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
     content.hash(&mut hasher);
     hasher.finish()
+}
+
+/// Minimum number of lines that must change between two snapshots before
+/// we consider the session "actively changing" (i.e., real conversation output).
+/// Changes below this threshold are attributed to decorative elements:
+/// TUI status bars, mascot animations (Bramblesnit blink), thinking spinners.
+const STABLE_CHANGE_THRESHOLD: usize = 4;
+
+/// Hash of the top portion of the visible pane viewport.
+///
+/// Used as a quick pre-check: if this hash is unchanged, the content
+/// is definitely stable. When it does change, `count_changed_lines` is
+/// called to decide whether the change is significant enough to reset
+/// `last_stable_change` (see `STABLE_CHANGE_THRESHOLD`).
+pub(crate) fn content_hash_stable(content: &str) -> u64 {
+    let lines: Vec<&str> = content.lines().collect();
+    let visible_start = lines.len().saturating_sub(50);
+    let visible = &lines[visible_start..];
+    let stable_end = visible.len().saturating_sub(8);
+    let stable = &visible[..stable_end];
+    let mut hasher = DefaultHasher::new();
+    stable.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Count lines that differ between two snapshots (changed + added/removed).
+pub(crate) fn count_changed_lines(old: &str, new: &str) -> usize {
+    let changed = old.lines().zip(new.lines()).filter(|(a, b)| a != b).count();
+    changed + old.lines().count().abs_diff(new.lines().count())
 }
 
 pub(crate) fn last_nonempty_line(content: &str) -> String {

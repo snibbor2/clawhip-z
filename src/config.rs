@@ -314,17 +314,18 @@ pub struct TmuxSessionMonitor {
     pub summarize: bool,
     #[serde(default = "default_summarizer")]
     pub summarizer: String,
+    /// Minutes between heartbeat events. Supports fractional values (e.g. 0.333 ≈ 20s). 0 = disable.
     #[serde(default)]
-    pub heartbeat_mins: u64,
+    pub heartbeat_mins: f64,
     /// Minimum number of new lines added before triggering summarization. 0 = no filter.
     #[serde(default)]
     pub min_new_lines: usize,
     /// Minimum minutes between LLM summarization calls for this session. 0 = no throttle.
     #[serde(default)]
     pub summarize_interval_mins: u64,
-    /// Minutes between heartbeat events. 0 = disable. Overrides heartbeat_mins when set.
+    /// Minutes between heartbeat events. Overrides heartbeat_mins. Supports fractional values.
     #[serde(default)]
-    pub heartbeat_interval: u64,
+    pub heartbeat_interval: f64,
     /// Minimum minutes between AI summary events. 0 = use summarize_interval_mins.
     #[serde(default)]
     pub summary_interval: u64,
@@ -366,10 +367,10 @@ impl Default for TmuxSessionMonitor {
             format: None,
             summarize: false,
             summarizer: default_summarizer(),
-            heartbeat_mins: 0,
+            heartbeat_mins: 0.0,
             min_new_lines: 0,
             summarize_interval_mins: 0,
-            heartbeat_interval: 0,
+            heartbeat_interval: 0.0,
             summary_interval: 0,
             detect_waiting: false,
             waiting_interval: 0,
