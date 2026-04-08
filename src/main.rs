@@ -247,10 +247,14 @@ async fn real_main() -> Result<()> {
             }
             TmuxCommands::New(args) => tmux_wrapper::run(args, config.as_ref()).await,
             TmuxCommands::Watch(args) => tmux_wrapper::watch(args, config.as_ref()).await,
-            TmuxCommands::List => {
+            TmuxCommands::List(args) => {
                 let client = DaemonClient::from_config(config.as_ref());
                 let registrations = client.list_tmux().await?;
-                render_tmux_list(&registrations);
+                if args.json {
+                    println!("{}", serde_json::to_string_pretty(&registrations)?);
+                } else {
+                    render_tmux_list(&registrations, args.compact);
+                }
                 Ok(())
             }
         },
@@ -333,11 +337,14 @@ async fn send_incoming_event(client: &DaemonClient, event: IncomingEvent) -> Res
     client.send_event(&event).await
 }
 
-fn render_tmux_list(registrations: &[crate::source::RegisteredTmuxSession]) {
-    print!("{}", format_tmux_list(registrations));
+fn render_tmux_list(registrations: &[crate::source::RegisteredTmuxSession], compact: bool) {
+    print!("{}", format_tmux_list(registrations, compact));
 }
 
-fn format_tmux_list(registrations: &[crate::source::RegisteredTmuxSession]) -> String {
+fn format_tmux_list(
+    registrations: &[crate::source::RegisteredTmuxSession],
+    compact: bool,
+) -> String {
     use crate::source::RegisteredTmuxSession;
     use time::format_description::well_known::Rfc3339;
 
@@ -351,50 +358,169 @@ fn format_tmux_list(registrations: &[crate::source::RegisteredTmuxSession]) -> S
         .max()
         .unwrap_or(7)
         .max(7);
-    let col_status = 18;
+    let col_status = registrations
+        .iter()
+        .map(|r| format_live_status(r).len())
+        .max()
+        .unwrap_or(8)
+        .max(8);
     let col_channel = registrations
         .iter()
         .map(|r| r.channel.as_deref().unwrap_or("-").len())
         .max()
         .unwrap_or(7)
         .max(7);
-    let col_features = 22;
-    let col_registered = 12;
+    let col_features = registrations
+        .iter()
+        .map(|r| format_features(r).len())
+        .max()
+        .unwrap_or(8)
+        .max(8);
 
-    let mut output = format!(
-        "{:<w1$}  {:<w2$}  {:<w3$}  {:<w4$}  {}\n",
-        "SESSION",
-        "STATUS",
-        "CHANNEL",
-        "FEATURES",
-        "REGISTERED",
-        w1 = col_session,
-        w2 = col_status,
-        w3 = col_channel,
-        w4 = col_features,
-    );
+    let mut output = String::new();
 
-    let total = col_session + col_status + col_channel + col_features + col_registered + 10;
-    output.push_str(&"\u{2500}".repeat(total));
-    output.push('\n');
-
-    for r in registrations {
-        let status = format_live_status(r);
-        let channel = r.channel.as_deref().unwrap_or("-");
-        let features = format_features(r);
-        let registered = format_relative_time(&r.registered_at);
-
+    if compact {
+        let col_registered = 12usize;
         output.push_str(&format!(
             "{:<w1$}  {:<w2$}  {:<w3$}  {:<w4$}  {}\n",
-            r.session,
-            status,
-            channel,
-            features,
-            registered,
+            "SESSION",
+            "STATUS",
+            "CHANNEL",
+            "FEATURES",
+            "REGISTERED",
             w1 = col_session,
             w2 = col_status,
             w3 = col_channel,
             w4 = col_features,
+        ));
+        let total = col_session + col_status + col_channel + col_features + col_registered + 10;
+        output.push_str(&"\u{2500}".repeat(total));
+        output.push('\n');
+        for r in registrations {
+            output.push_str(&format!(
+                "{:<w1$}  {:<w2$}  {:<w3$}  {:<w4$}  {}\n",
+                r.session,
+                format_live_status(r),
+                r.channel.as_deref().unwrap_or("-"),
+                format_features(r),
+                format_relative_time(&r.registered_at),
+                w1 = col_session,
+                w2 = col_status,
+                w3 = col_channel,
+                w4 = col_features,
+            ));
+        }
+        return output;
+    }
+
+    // Full view — all columns
+    let col_keywords = registrations
+        .iter()
+        .map(|r| {
+            if r.keywords.is_empty() {
+                1
+            } else {
+                r.keywords.join(",").len()
+            }
+        })
+        .max()
+        .unwrap_or(8)
+        .max(8);
+    let col_mention = registrations
+        .iter()
+        .map(|r| r.mention.as_deref().unwrap_or("-").len())
+        .max()
+        .unwrap_or(7)
+        .max(7);
+    let col_stale = 5usize;
+    let col_source = registrations
+        .iter()
+        .map(|r| r.registration_source.as_str().len())
+        .max()
+        .unwrap_or(6)
+        .max(6);
+    let col_registered = 12usize;
+    let col_parent = registrations
+        .iter()
+        .map(|r| {
+            r.parent_process
+                .as_ref()
+                .map(|p| format!("{}:{}", p.pid, p.name.as_deref().unwrap_or("?")).len())
+                .unwrap_or(1)
+        })
+        .max()
+        .unwrap_or(6)
+        .max(6);
+
+    output.push_str(&format!(
+        "{:<w1$}  {:<w2$}  {:<w3$}  {:<w4$}  {:<w5$}  {:<w6$}  {:<w7$}  {:<w8$}  {:<w9$}  {}\n",
+        "SESSION",
+        "STATUS",
+        "CHANNEL",
+        "KEYWORDS",
+        "MENTION",
+        "STALE",
+        "FEATURES",
+        "SOURCE",
+        "REGISTERED",
+        "PARENT",
+        w1 = col_session,
+        w2 = col_status,
+        w3 = col_channel,
+        w4 = col_keywords,
+        w5 = col_mention,
+        w6 = col_stale,
+        w7 = col_features,
+        w8 = col_source,
+        w9 = col_registered,
+    ));
+    let total = col_session
+        + col_status
+        + col_channel
+        + col_keywords
+        + col_mention
+        + col_stale
+        + col_features
+        + col_source
+        + col_registered
+        + col_parent
+        + 20;
+    output.push_str(&"\u{2500}".repeat(total));
+    output.push('\n');
+
+    for r in registrations {
+        let keywords = if r.keywords.is_empty() {
+            "-".to_string()
+        } else {
+            r.keywords.join(",")
+        };
+        let mention = r.mention.as_deref().unwrap_or("-");
+        let parent = r
+            .parent_process
+            .as_ref()
+            .map(|p| format!("{}:{}", p.pid, p.name.as_deref().unwrap_or("?")))
+            .unwrap_or_else(|| "-".to_string());
+        output.push_str(&format!(
+            "{:<w1$}  {:<w2$}  {:<w3$}  {:<w4$}  {:<w5$}  {:<w6$}  {:<w7$}  {:<w8$}  {:<w9$}  {}\n",
+            r.session,
+            format_live_status(r),
+            r.channel.as_deref().unwrap_or("-"),
+            keywords,
+            mention,
+            r.stale_minutes,
+            format_features(r),
+            r.registration_source.as_str(),
+            format_relative_time(&r.registered_at),
+            parent,
+            w1 = col_session,
+            w2 = col_status,
+            w3 = col_channel,
+            w4 = col_keywords,
+            w5 = col_mention,
+            w6 = col_stale,
+            w7 = col_features,
+            w8 = col_source,
+            w9 = col_registered,
         ));
     }
 
@@ -508,7 +634,7 @@ mod tests {
             ),
             last_poll: None,
         });
-        let output = format_tmux_list(&[reg]);
+        let output = format_tmux_list(&[reg], false);
 
         assert!(output.contains("SESSION"));
         assert!(output.contains("STATUS"));
@@ -526,7 +652,7 @@ mod tests {
     #[test]
     fn format_tmux_list_handles_empty_registry() {
         assert_eq!(
-            format_tmux_list(&[]),
+            format_tmux_list(&[], false),
             "No active tmux sessions registered.\n"
         );
     }
@@ -538,7 +664,7 @@ mod tests {
             registered_at: "2026-04-02T00:00:00Z".into(),
             ..Default::default()
         };
-        let output = format_tmux_list(&[reg]);
+        let output = format_tmux_list(&[reg], false);
         assert!(output.contains("\u{2014}"));
     }
 
@@ -548,7 +674,7 @@ mod tests {
         reg.heartbeat_mins = 5;
         reg.pin_status = true;
         reg.live_state = Some(SessionLiveState::default());
-        let output = format_tmux_list(&[reg]);
+        let output = format_tmux_list(&[reg], false);
         assert!(output.contains("\u{2665}"));
         assert!(output.contains("pins"));
     }
@@ -560,7 +686,7 @@ mod tests {
             .unwrap();
         let mut reg = make_registration("time-test");
         reg.registered_at = now;
-        let output = format_tmux_list(&[reg]);
+        let output = format_tmux_list(&[reg], false);
         assert!(output.contains("s ago"));
     }
 
@@ -573,7 +699,7 @@ mod tests {
             last_activity: None,
             last_poll: None,
         });
-        let output = format_tmux_list(&[reg]);
+        let output = format_tmux_list(&[reg], false);
         assert!(output.contains("dead"));
     }
 
@@ -586,14 +712,14 @@ mod tests {
             last_activity: None,
             last_poll: None,
         });
-        let output = format_tmux_list(&[reg]);
+        let output = format_tmux_list(&[reg], false);
         assert!(output.contains("waiting"));
     }
 
     #[test]
     fn format_live_status_unknown() {
         let reg = make_registration("unknown-test");
-        let output = format_tmux_list(&[reg]);
+        let output = format_tmux_list(&[reg], false);
         assert!(output.contains("unknown"));
     }
 

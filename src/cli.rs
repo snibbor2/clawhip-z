@@ -403,7 +403,17 @@ pub enum TmuxCommands {
     New(TmuxNewArgs),
     Watch(TmuxWatchArgs),
     /// List active tmux watch registrations known to the daemon.
-    List,
+    List(TmuxListArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct TmuxListArgs {
+    /// Show compact view (SESSION, STATUS, CHANNEL, FEATURES, REGISTERED only).
+    #[arg(long, short = 'c')]
+    pub compact: bool,
+    /// Output raw JSON.
+    #[arg(long, short = 'j')]
+    pub json: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -806,7 +816,7 @@ mod tests {
             panic!("expected tmux command");
         };
 
-        assert!(matches!(command, TmuxCommands::List));
+        assert!(matches!(command, TmuxCommands::List(_)));
     }
 
     #[test]
