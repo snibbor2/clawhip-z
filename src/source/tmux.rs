@@ -195,6 +195,7 @@ struct TmuxMonitorState {
     pending_keyword_hits: HashMap<String, PendingKeywordHits>,
     session_last_heartbeat: HashMap<String, Instant>,
     session_last_summarized: HashMap<String, Instant>,
+    session_last_summarized_snapshot: HashMap<String, String>,
 }
 
 struct TmuxPaneSnapshot {
@@ -214,6 +215,7 @@ pub async fn monitor_registered_session(
     let mut pending_keyword_hits = None;
     let mut last_heartbeat = None;
     let mut last_summarized: Option<Instant> = None;
+    let mut last_summarized_snapshot: Option<String> = None;
     let poll_interval = Duration::from_secs(1);
 
     loop {
@@ -277,27 +279,6 @@ pub async fn monitor_registered_session(
                         );
                         push_pending_keyword_hits(&mut pending_keyword_hits, now, hits);
 
-                        if registration.summarize
-                            && should_summarize_now(
-                                last_summarized,
-                                registration.effective_summary_interval(),
-                                registration.min_new_lines,
-                                &existing.snapshot,
-                                &pane.content,
-                                now,
-                            )
-                        {
-                            spawn_content_changed_task(
-                                client.clone(),
-                                registration.clone(),
-                                pane.session.clone(),
-                                pane.pane_name.clone(),
-                                pane.content.clone(),
-                                providers.clone(),
-                            );
-                            last_summarized = Some(now);
-                        }
-
                         existing.session = pane.session;
                         existing.pane_name = pane.pane_name;
                         existing.content_hash = hash;
@@ -326,6 +307,16 @@ pub async fn monitor_registered_session(
             &client,
             &panes,
             &mut last_heartbeat,
+            Instant::now(),
+        )
+        .await?;
+        maybe_emit_registered_session_summary(
+            &registration,
+            &client,
+            &panes,
+            &mut last_summarized,
+            &mut last_summarized_snapshot,
+            providers.clone(),
             Instant::now(),
         )
         .await?;
@@ -467,28 +458,6 @@ async fn poll_tmux(
                                     &pane.content,
                                     &registration.keywords,
                                 );
-                                if registration.summarize
-                                    && should_summarize_now(
-                                        state.session_last_summarized.get(session_name).copied(),
-                                        registration.effective_summary_interval(),
-                                        registration.min_new_lines,
-                                        &existing.snapshot,
-                                        &pane.content,
-                                        now,
-                                    )
-                                {
-                                    spawn_content_changed_task(
-                                        tx.clone(),
-                                        registration.clone(),
-                                        session_name.clone(),
-                                        pane.pane_name.clone(),
-                                        pane.content.clone(),
-                                        config.providers.clone(),
-                                    );
-                                    state
-                                        .session_last_summarized
-                                        .insert(session_name.to_string(), now);
-                                }
                                 existing.pane_name = pane.pane_name;
                                 existing.snapshot = pane.content;
                                 existing.content_hash = hash;
@@ -533,6 +502,67 @@ async fn poll_tmux(
                     session_changed,
                 )
                 .await?;
+
+                // Interval-based summarization: fire only when stable content changed since last summary
+                if registration.summarize {
+                    let last_sum = state.session_last_summarized.get(session_name).copied();
+                    let last_sum_snapshot = state.session_last_summarized_snapshot
+                        .get(session_name)
+                        .cloned();
+
+                    let interval_secs = registration.effective_summary_interval() * 60;
+                    let interval_elapsed = if interval_secs == 0 {
+                        true
+                    } else {
+                        last_sum
+                            .map(|t| now.duration_since(t).as_secs() >= interval_secs)
+                            .unwrap_or(true)
+                    };
+
+                    if interval_elapsed {
+                        let last_change = state
+                            .panes
+                            .values()
+                            .filter(|p| p.session == *session_name)
+                            .map(|p| p.last_change)
+                            .max();
+                        let changed = if let Some(ls) = last_change {
+                            let last_sum_time = last_sum
+                                .unwrap_or_else(|| now - Duration::from_secs(interval_secs + 1));
+                            ls > last_sum_time || last_sum.is_none()
+                        } else {
+                            false
+                        };
+
+                        if changed {
+                            if let Some(pane) = state
+                                .panes
+                                .values()
+                                .find(|p| p.session == *session_name)
+                            {
+                                let min_ok = registration.min_new_lines == 0
+                                    || count_new_lines(
+                                        last_sum_snapshot.as_deref().unwrap_or(""),
+                                        &pane.snapshot,
+                                    ) >= registration.min_new_lines;
+                                if min_ok {
+                                    let snapshot = pane.snapshot.clone();
+                                    let pane_name = pane.pane_name.clone();
+                                    spawn_content_changed_task(
+                                        tx.clone(),
+                                        registration.clone(),
+                                        session_name.clone(),
+                                        pane_name,
+                                        snapshot.clone(),
+                                        config.providers.clone(),
+                                    );
+                                    state.session_last_summarized.insert(session_name.to_string(), now);
+                                    state.session_last_summarized_snapshot.insert(session_name.to_string(), snapshot);
+                                }
+                            }
+                        }
+                    }
+                }
             }
             Err(error) => eprintln!(
                 "clawhip source tmux snapshot failed for {}: {error}",
@@ -558,6 +588,9 @@ async fn poll_tmux(
         .retain(|session, _| sessions.contains_key(session));
     state
         .session_last_summarized
+        .retain(|session, _| sessions.contains_key(session));
+    state
+        .session_last_summarized_snapshot
         .retain(|session, _| sessions.contains_key(session));
 
     Ok(())
@@ -846,6 +879,7 @@ fn count_new_lines(old: &str, new: &str) -> usize {
     new.lines().count().saturating_sub(old.lines().count())
 }
 
+#[cfg(test)]
 fn should_summarize_now(
     last_summarized: Option<Instant>,
     interval_mins: u64,
@@ -952,6 +986,67 @@ async fn maybe_emit_registered_session_heartbeat<E: EventEmitter>(
         ))
         .await?;
     *last_heartbeat_at = now;
+    Ok(())
+}
+
+async fn maybe_emit_registered_session_summary<E: EventEmitter + Clone + Send + Sync + 'static>(
+    registration: &RegisteredTmuxSession,
+    emitter: &E,
+    panes: &HashMap<String, TmuxPaneState>,
+    last_summarized: &mut Option<Instant>,
+    last_summarized_snapshot: &mut Option<String>,
+    providers: crate::config::ProvidersConfig,
+    now: Instant,
+) -> Result<()> {
+    if !registration.summarize || registration.effective_summary_interval() == 0 {
+        return Ok(());
+    }
+
+    let interval = Duration::from_secs(registration.effective_summary_interval() * 60);
+
+    // Check: has enough time elapsed since last summary?
+    let interval_elapsed = last_summarized
+        .map(|t| now.duration_since(t) >= interval)
+        .unwrap_or(true);
+    if !interval_elapsed {
+        return Ok(());
+    }
+
+    // Check: did content change since last summary?
+    let Some(last_change) = panes.values().map(|p| p.last_change).max() else {
+        return Ok(());
+    };
+    let last_sum_time = last_summarized
+        .unwrap_or_else(|| now - interval - Duration::from_secs(1));
+    if last_change <= last_sum_time && last_summarized.is_some() {
+        return Ok(());
+    }
+
+    // Get current pane snapshot
+    let Some(pane) = panes.values().next() else {
+        return Ok(());
+    };
+
+    // Check min_new_lines threshold against snapshot at last summary
+    if registration.min_new_lines > 0 {
+        let old = last_summarized_snapshot.as_deref().unwrap_or("");
+        if count_new_lines(old, &pane.snapshot) < registration.min_new_lines {
+            return Ok(());
+        }
+    }
+
+    // All conditions met — fire summary
+    *last_summarized = Some(now);
+    *last_summarized_snapshot = Some(pane.snapshot.clone());
+
+    spawn_content_changed_task(
+        emitter.clone(),
+        registration.clone(),
+        pane.session.clone(),
+        pane.pane_name.clone(),
+        pane.snapshot.clone(),
+        providers,
+    );
     Ok(())
 }
 
